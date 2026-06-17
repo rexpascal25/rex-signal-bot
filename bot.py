@@ -1,12 +1,15 @@
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 import asyncio
 import re
+import os
 
-API_ID = 38204492
-API_HASH = 'a92814edfc66bbc882ef019e2a2b35f3'
-BOT_TOKEN = '8938711224:AAGUE7ZZrF8Jkvw6Pu-31gdl03AiFQ--s8o'
-SOURCE_GROUP = 'https://t.me/+_iUGF8oXadg4M2I8'
-DEST_GROUP = 'https://t.me/+xpJoAOt0B2c4N2I0'
+API_ID = int(os.environ.get('API_ID'))
+API_HASH = os.environ.get('API_HASH')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+SOURCE_GROUP = os.environ.get('SOURCE_GROUP')
+DEST_GROUP = os.environ.get('DEST_GROUP')
+SESSION_STRING = os.environ.get('SESSION_STRING', '')
 
 SIGNAL_KEYWORDS = [
     'BUY','SELL','PUT','CALL','SIGNAL','ENTRY',
@@ -35,12 +38,17 @@ def is_signal_message(text):
             return True
     return False
 
-userbot = TelegramClient('userbot_session', API_ID, API_HASH)
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
 async def main():
-    await userbot.start()
+    if SESSION_STRING:
+        userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    else:
+        userbot = TelegramClient(StringSession(), API_ID, API_HASH)
+
+    bot = TelegramClient('bot', API_ID, API_HASH)
+
+    await userbot.start(phone=lambda: input('Phone: '))
     await bot.start(bot_token=BOT_TOKEN)
+
     print("✅ Bot is running...")
     source_entity = await userbot.get_entity(SOURCE_GROUP)
     dest_entity = await bot.get_entity(DEST_GROUP)
@@ -50,7 +58,7 @@ async def main():
         message = event.message
         text = message.text or message.caption or ''
         if is_signal_message(text):
-            print(f"🚨 Signal detected: {text[:50]}...")
+            print(f"🚨 Signal: {text[:50]}...")
             try:
                 if message.media:
                     await bot.send_file(dest_entity, file=message.media, caption=text)
@@ -60,7 +68,7 @@ async def main():
             except Exception as e:
                 print(f"❌ Error: {e}")
 
-    print("🤖 Rex Signal Bot is LIVE!")
+    print("🤖 Rex Signal Bot LIVE!")
     await userbot.run_until_disconnected()
 
 if __name__ == '__main__':
