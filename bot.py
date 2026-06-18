@@ -40,53 +40,72 @@ def is_signal_message(text):
 
 async def main():
     print("🚀 Starting Rex Signal Bot...")
-    
-    userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    bot = TelegramClient('bot', API_ID, API_HASH)
+
+    userbot = TelegramClient(
+        StringSession(SESSION_STRING),
+        API_ID,
+        API_HASH,
+        connection_retries=5,
+        retry_delay=3,
+        timeout=30
+    )
+
+    bot = TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH
+    )
 
     print("🔌 Connecting userbot...")
     await userbot.connect()
-    print("✅ Userbot connected!")
 
-    print("🔌 Connecting bot...")
-    await bot.start(bot_token=BOT_TOKEN)
-    print("✅ Bot connected!")
-
-    print(f"📥 Getting source group: {SOURCE_GROUP}")
-    try:
-        source_entity = await userbot.get_entity(SOURCE_GROUP)
-        print(f"✅ Source group found: {source_entity.title}")
-    except Exception as e:
-        print(f"❌ Source group error: {e}")
+    if not await userbot.is_user_authorized():
+        print("❌ Session string invalid or expired!")
         return
 
-    print(f"📤 Getting destination group: {DEST_GROUP}")
+    print("✅ Userbot connected and authorized!")
+
+    print("🔌 Starting bot...")
+    await bot.start(bot_token=BOT_TOKEN)
+    print("✅ Bot started!")
+
+    print(f"📥 Finding source group...")
+    try:
+        source_entity = await userbot.get_entity(SOURCE_GROUP)
+        print(f"✅ Source: {source_entity.title}")
+    except Exception as e:
+        print(f"❌ Source error: {e}")
+        return
+
+    print(f"📤 Finding destination group...")
     try:
         dest_entity = await bot.get_entity(DEST_GROUP)
-        print(f"✅ Destination group found: {dest_entity.title}")
+        print(f"✅ Destination: {dest_entity.title}")
     except Exception as e:
-        print(f"❌ Destination group error: {e}")
+        print(f"❌ Destination error: {e}")
         return
 
     @userbot.on(events.NewMessage(chats=source_entity))
     async def handler(event):
         message = event.message
         text = message.text or message.caption or ''
-        print(f"📨 New message received: {text[:30]}...")
+        print(f"📨 Message: {text[:30]}...")
         if is_signal_message(text):
             print(f"🚨 Signal detected!")
             try:
                 if message.media:
-                    await bot.send_file(dest_entity, file=message.media, caption=text)
+                    await bot.send_file(
+                        dest_entity,
+                        file=message.media,
+                        caption=text
+                    )
                 else:
                     await bot.send_message(dest_entity, text)
-                print("✅ Signal forwarded!")
+                print("✅ Forwarded!")
             except Exception as e:
-                print(f"❌ Forward error: {e}")
-        else:
-            print("⏭️ Not a signal, skipping")
+                print(f"❌ Error: {e}")
 
-    print("🤖 Rex Signal Bot is LIVE and listening!")
+    print("🤖 Rex Signal Bot is LIVE!")
     await userbot.run_until_disconnected()
 
 if __name__ == '__main__':
