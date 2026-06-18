@@ -45,9 +45,12 @@ async def main():
         StringSession(SESSION_STRING),
         API_ID,
         API_HASH,
-        connection_retries=5,
-        retry_delay=3,
-        timeout=30
+        connection_retries=10,
+        retry_delay=5,
+        timeout=60,
+        device_model="Linux",
+        system_version="Ubuntu 20.04",
+        app_version="1.0"
     )
 
     bot = TelegramClient(
@@ -57,19 +60,31 @@ async def main():
     )
 
     print("🔌 Connecting userbot...")
-    await userbot.connect()
+    try:
+        await asyncio.wait_for(userbot.connect(), timeout=60)
+        print("✅ Userbot connected!")
+    except asyncio.TimeoutError:
+        print("❌ Userbot connection timed out!")
+        return
+    except Exception as e:
+        print(f"❌ Userbot connection error: {e}")
+        return
 
     if not await userbot.is_user_authorized():
         print("❌ Session string invalid or expired!")
         return
 
-    print("✅ Userbot connected and authorized!")
+    print("✅ Userbot authorized!")
 
     print("🔌 Starting bot...")
-    await bot.start(bot_token=BOT_TOKEN)
-    print("✅ Bot started!")
+    try:
+        await bot.start(bot_token=BOT_TOKEN)
+        print("✅ Bot started!")
+    except Exception as e:
+        print(f"❌ Bot start error: {e}")
+        return
 
-    print(f"📥 Finding source group...")
+    print("📥 Finding source group...")
     try:
         source_entity = await userbot.get_entity(SOURCE_GROUP)
         print(f"✅ Source: {source_entity.title}")
@@ -77,7 +92,7 @@ async def main():
         print(f"❌ Source error: {e}")
         return
 
-    print(f"📤 Finding destination group...")
+    print("📤 Finding destination group...")
     try:
         dest_entity = await bot.get_entity(DEST_GROUP)
         print(f"✅ Destination: {dest_entity.title}")
@@ -91,7 +106,7 @@ async def main():
         text = message.text or message.caption or ''
         print(f"📨 Message: {text[:30]}...")
         if is_signal_message(text):
-            print(f"🚨 Signal detected!")
+            print("🚨 Signal detected!")
             try:
                 if message.media:
                     await bot.send_file(
@@ -103,7 +118,9 @@ async def main():
                     await bot.send_message(dest_entity, text)
                 print("✅ Forwarded!")
             except Exception as e:
-                print(f"❌ Error: {e}")
+                print(f"❌ Forward error: {e}")
+        else:
+            print("⏭️ Not a signal, skipping")
 
     print("🤖 Rex Signal Bot is LIVE!")
     await userbot.run_until_disconnected()
