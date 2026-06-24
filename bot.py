@@ -4,6 +4,7 @@ import asyncio
 import re
 import os
 import logging
+import socks
 
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
@@ -22,11 +23,11 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 
 # ── Proxy settings (rotating through multiple proxies) ──────────
 PROXIES = [
-    ("socks5", "159.65.181.194", 9050),
-    ("socks5", "46.8.31.104", 1080),
-    ("socks5", "45.144.49.156", 1080),
-    ("socks5", "77.239.106.24", 1080),
-    ("socks5", "89.22.226.129", 1080),
+    (socks.SOCKS5, "159.65.181.194", 9050),
+    (socks.SOCKS5, "46.8.31.104", 1080),
+    (socks.SOCKS5, "45.144.49.156", 1080),
+    (socks.SOCKS5, "77.239.106.24", 1080),
+    (socks.SOCKS5, "89.22.226.129", 1080),
 ]
 
 # ── Signal keywords ─────────────────────────────────────────────
@@ -102,13 +103,16 @@ async def run_bot(proxy):
         await asyncio.wait_for(userbot.connect(), timeout=60)
     except asyncio.TimeoutError:
         logger.error(f"❌ Proxy {proxy[1]} timed out! Trying next proxy...")
+        await userbot.disconnect()
         return False
     except Exception as e:
         logger.error(f"❌ Connection error with proxy {proxy[1]}: {e}")
+        await userbot.disconnect()
         return False
 
     if not await userbot.is_user_authorized():
         logger.error("❌ SESSION_STRING is invalid or expired! Generate a new one.")
+        await userbot.disconnect()
         return False
 
     me = await userbot.get_me()
@@ -121,6 +125,7 @@ async def run_bot(proxy):
         logger.info("✅ Bot started!")
     except Exception as e:
         logger.error(f"❌ Bot start error: {e}")
+        await userbot.disconnect()
         return False
 
     # ── Resolve source & destination ────────────────────────────
@@ -130,6 +135,8 @@ async def run_bot(proxy):
         logger.info(f"✅ Source: {source_entity.title}")
     except Exception as e:
         logger.error(f"❌ Source error: {e}")
+        await userbot.disconnect()
+        await bot.disconnect()
         return False
 
     logger.info("📤 Finding destination group...")
@@ -138,6 +145,8 @@ async def run_bot(proxy):
         logger.info(f"✅ Destination: {dest_entity.title}")
     except Exception as e:
         logger.error(f"❌ Destination error: {e}")
+        await userbot.disconnect()
+        await bot.disconnect()
         return False
 
     # ── Message handler ─────────────────────────────────────────
@@ -194,6 +203,7 @@ async def main():
                     await asyncio.sleep(10)
             else:
                 fail_count = 0
+                proxy_index = 0
         except Exception as e:
             logger.error(f"💥 Bot crashed: {e}")
             proxy_index += 1
