@@ -3,27 +3,47 @@ from telethon.sessions import StringSession
 import asyncio
 import re
 import os
+import logging
 
-API_ID = int(os.environ.get('API_ID'))
-API_HASH = os.environ.get('API_HASH')
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-SOURCE_GROUP = os.environ.get('SOURCE_GROUP')
-DEST_GROUP = os.environ.get('DEST_GROUP')
+# ── Logging setup ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ── Environment variables ───────────────────────────────────────
+API_ID         = int(os.environ.get('API_ID', 0))
+API_HASH       = os.environ.get('API_HASH', '')
+BOT_TOKEN      = os.environ.get('BOT_TOKEN', '')
+SOURCE_GROUP   = os.environ.get('SOURCE_GROUP', '')
+DEST_GROUP     = os.environ.get('DEST_GROUP', '')
 SESSION_STRING = os.environ.get('SESSION_STRING', '')
 
+# ── Proxy settings (rotating through multiple proxies) ──────────
+PROXIES = [
+    ("socks5", "159.65.181.194", 9050),
+    ("socks5", "46.8.31.104", 1080),
+    ("socks5", "45.144.49.156", 1080),
+    ("socks5", "77.239.106.24", 1080),
+    ("socks5", "89.22.226.129", 1080),
+]
+
+# ── Signal keywords ─────────────────────────────────────────────
 SIGNAL_KEYWORDS = [
-    'BUY','SELL','PUT','CALL','SIGNAL','ENTRY',
-    'EXPIRATION','MARTINGALE','WIN','OTC','GBP',
-    'USD','EUR','DIRECT WIN','INSTANT EXECUTION',
-    'DO BUY','🟥','🟩','⏺','🕘','✅','1️⃣','2️⃣','3️⃣'
+    'BUY', 'SELL', 'PUT', 'CALL', 'SIGNAL', 'ENTRY',
+    'EXPIRATION', 'MARTINGALE', 'WIN', 'OTC', 'GBP',
+    'USD', 'EUR', 'DIRECT WIN', 'INSTANT EXECUTION',
+    'DO BUY', '🟥', '🟩', '⏺', '🕘', '✅', '1️⃣', '2️⃣', '3️⃣'
 ]
 
 PROFIT_KEYWORDS = [
-    'screenshot','profit','screenshots',
-    'win at','win ✅','✅ win',
-    'instant execution','do buy in'
+    'screenshot', 'profit', 'screenshots',
+    'win at', 'win ✅', '✅ win',
+    'instant execution', 'do buy in'
 ]
 
+# ── Signal detection ────────────────────────────────────────────
 def is_signal_message(text):
     if not text:
         return False
@@ -38,14 +58,31 @@ def is_signal_message(text):
             return True
     return False
 
-async def main():
-    print("🚀 Starting Rex Signal Bot...")
+# ── Keepalive ping every 4 minutes ─────────────────────────────
+async def keepalive(client):
+    while True:
+        try:
+            await asyncio.sleep(240)
+            await client.get_me()
+            logger.info("💓 Keepalive ping OK")
+        except Exception as e:
+            logger.warning(f"⚠️ Keepalive error: {e}")
+
+# ── Main bot logic ──────────────────────────────────────────────
+async def run_bot(proxy):
+    logger.info(f"🚀 Starting Rex Signal Bot with proxy {proxy[1]}:{proxy[2]}...")
+
+    # Validate env vars
+    if not all([API_ID, API_HASH, BOT_TOKEN, SOURCE_GROUP, DEST_GROUP, SESSION_STRING]):
+        logger.error("❌ Missing environment variables! Check Railway Variables tab.")
+        return False
 
     userbot = TelegramClient(
         StringSession(SESSION_STRING),
         API_ID,
         API_HASH,
-        connection_retries=10,
+        proxy=proxy,
+        connection_retries=15,
         retry_delay=5,
         timeout=60,
         device_model="Linux",
@@ -54,59 +91,65 @@ async def main():
     )
 
     bot = TelegramClient(
-        StringSession(),
+        'bot_session',
         API_ID,
         API_HASH
     )
 
-    print("🔌 Connecting userbot...")
+    # ── Connect userbot ─────────────────────────────────────────
+    logger.info("🔌 Connecting userbot...")
     try:
         await asyncio.wait_for(userbot.connect(), timeout=60)
-        print("✅ Userbot connected!")
     except asyncio.TimeoutError:
-        print("❌ Userbot connection timed out!")
-        return
+        logger.error(f"❌ Proxy {proxy[1]} timed out! Trying next proxy...")
+        return False
     except Exception as e:
-        print(f"❌ Userbot connection error: {e}")
-        return
+        logger.error(f"❌ Connection error with proxy {proxy[1]}: {e}")
+        return False
 
     if not await userbot.is_user_authorized():
-        print("❌ Session string invalid or expired!")
-        return
+        logger.error("❌ SESSION_STRING is invalid or expired! Generate a new one.")
+        return False
 
-    print("✅ Userbot authorized!")
+    me = await userbot.get_me()
+    logger.info(f"✅ Userbot authorized as: {me.first_name} (@{me.username})")
 
-    print("🔌 Starting bot...")
+    # ── Start bot ───────────────────────────────────────────────
+    logger.info("🔌 Starting bot...")
     try:
         await bot.start(bot_token=BOT_TOKEN)
-        print("✅ Bot started!")
+        logger.info("✅ Bot started!")
     except Exception as e:
-        print(f"❌ Bot start error: {e}")
-        return
+        logger.error(f"❌ Bot start error: {e}")
+        return False
 
-    print("📥 Finding source group...")
+    # ── Resolve source & destination ────────────────────────────
+    logger.info("📥 Finding source group...")
     try:
         source_entity = await userbot.get_entity(SOURCE_GROUP)
-        print(f"✅ Source: {source_entity.title}")
+        logger.info(f"✅ Source: {source_entity.title}")
     except Exception as e:
-        print(f"❌ Source error: {e}")
-        return
+        logger.error(f"❌ Source error: {e}")
+        return False
 
-    print("📤 Finding destination group...")
+    logger.info("📤 Finding destination group...")
     try:
         dest_entity = await bot.get_entity(DEST_GROUP)
-        print(f"✅ Destination: {dest_entity.title}")
+        logger.info(f"✅ Destination: {dest_entity.title}")
     except Exception as e:
-        print(f"❌ Destination error: {e}")
-        return
+        logger.error(f"❌ Destination error: {e}")
+        return False
 
+    # ── Message handler ─────────────────────────────────────────
     @userbot.on(events.NewMessage(chats=source_entity))
     async def handler(event):
         message = event.message
         text = message.text or message.caption or ''
-        print(f"📨 Message: {text[:30]}...")
+        preview = text[:40].replace('\n', ' ')
+        logger.info(f"📨 New message: {preview}...")
+
         if is_signal_message(text):
-            print("🚨 Signal detected!")
+            logger.info("🚨 Signal detected! Forwarding...")
             try:
                 if message.media:
                     await bot.send_file(
@@ -116,14 +159,47 @@ async def main():
                     )
                 else:
                     await bot.send_message(dest_entity, text)
-                print("✅ Forwarded!")
+                logger.info("✅ Forwarded successfully!")
             except Exception as e:
-                print(f"❌ Forward error: {e}")
+                logger.error(f"❌ Forward error: {e}")
         else:
-            print("⏭️ Not a signal, skipping")
+            logger.info("⏭️ Not a signal, skipping")
 
-    print("🤖 Rex Signal Bot is LIVE!")
+    # ── Start keepalive & run ───────────────────────────────────
+    logger.info("🤖 Rex Signal Bot is LIVE! Listening for signals...")
+    asyncio.create_task(keepalive(userbot))
     await userbot.run_until_disconnected()
+    return True
+
+
+# ── Auto-restart with proxy rotation ───────────────────────────
+async def main():
+    proxy_index = 0
+    fail_count = 0
+
+    while True:
+        proxy = PROXIES[proxy_index % len(PROXIES)]
+        try:
+            success = await run_bot(proxy)
+            if not success:
+                fail_count += 1
+                logger.warning(f"⚠️ Proxy {proxy[1]} failed. Trying next one...")
+                proxy_index += 1
+                if fail_count >= len(PROXIES):
+                    logger.error("❌ All proxies failed! Waiting 5 minutes before retry...")
+                    fail_count = 0
+                    proxy_index = 0
+                    await asyncio.sleep(300)
+                else:
+                    await asyncio.sleep(10)
+            else:
+                fail_count = 0
+        except Exception as e:
+            logger.error(f"💥 Bot crashed: {e}")
+            proxy_index += 1
+        logger.warning("🔄 Restarting in 30 seconds...")
+        await asyncio.sleep(30)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
