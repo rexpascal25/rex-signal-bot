@@ -4,7 +4,6 @@ import asyncio
 import re
 import os
 import logging
-import socks
 
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
@@ -20,15 +19,6 @@ BOT_TOKEN      = os.environ.get('BOT_TOKEN', '')
 SOURCE_GROUP   = os.environ.get('SOURCE_GROUP', '')
 DEST_GROUP     = os.environ.get('DEST_GROUP', '')
 SESSION_STRING = os.environ.get('SESSION_STRING', '')
-
-# ── Proxy settings (rotating through multiple proxies) ──────────
-PROXIES = [
-    (socks.SOCKS5, "159.65.181.194", 9050),
-    (socks.SOCKS5, "46.8.31.104", 1080),
-    (socks.SOCKS5, "45.144.49.156", 1080),
-    (socks.SOCKS5, "77.239.106.24", 1080),
-    (socks.SOCKS5, "89.22.226.129", 1080),
-]
 
 # ── Signal keywords ─────────────────────────────────────────────
 SIGNAL_KEYWORDS = [
@@ -70,19 +60,18 @@ async def keepalive(client):
             logger.warning(f"⚠️ Keepalive error: {e}")
 
 # ── Main bot logic ──────────────────────────────────────────────
-async def run_bot(proxy):
-    logger.info(f"🚀 Starting Rex Signal Bot with proxy {proxy[1]}:{proxy[2]}...")
+async def run_bot():
+    logger.info("🚀 Starting Rex Signal Bot...")
 
     # Validate env vars
     if not all([API_ID, API_HASH, BOT_TOKEN, SOURCE_GROUP, DEST_GROUP, SESSION_STRING]):
-        logger.error("❌ Missing environment variables! Check Railway Variables tab.")
+        logger.error("❌ Missing environment variables! Check Render Environment tab.")
         return False
 
     userbot = TelegramClient(
         StringSession(SESSION_STRING),
         API_ID,
         API_HASH,
-        proxy=proxy,
         connection_retries=15,
         retry_delay=5,
         timeout=60,
@@ -102,11 +91,11 @@ async def run_bot(proxy):
     try:
         await asyncio.wait_for(userbot.connect(), timeout=60)
     except asyncio.TimeoutError:
-        logger.error(f"❌ Proxy {proxy[1]} timed out! Trying next proxy...")
+        logger.error("❌ Connection timed out!")
         await userbot.disconnect()
         return False
     except Exception as e:
-        logger.error(f"❌ Connection error with proxy {proxy[1]}: {e}")
+        logger.error(f"❌ Connection error: {e}")
         await userbot.disconnect()
         return False
 
@@ -181,32 +170,13 @@ async def run_bot(proxy):
     return True
 
 
-# ── Auto-restart with proxy rotation ───────────────────────────
+# ── Auto-restart wrapper ────────────────────────────────────────
 async def main():
-    proxy_index = 0
-    fail_count = 0
-
     while True:
-        proxy = PROXIES[proxy_index % len(PROXIES)]
         try:
-            success = await run_bot(proxy)
-            if not success:
-                fail_count += 1
-                logger.warning(f"⚠️ Proxy {proxy[1]} failed. Trying next one...")
-                proxy_index += 1
-                if fail_count >= len(PROXIES):
-                    logger.error("❌ All proxies failed! Waiting 5 minutes before retry...")
-                    fail_count = 0
-                    proxy_index = 0
-                    await asyncio.sleep(300)
-                else:
-                    await asyncio.sleep(10)
-            else:
-                fail_count = 0
-                proxy_index = 0
+            await run_bot()
         except Exception as e:
             logger.error(f"💥 Bot crashed: {e}")
-            proxy_index += 1
         logger.warning("🔄 Restarting in 30 seconds...")
         await asyncio.sleep(30)
 
