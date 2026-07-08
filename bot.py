@@ -132,7 +132,7 @@ async def run_bot():
 
     logger.info("📤 Finding destination group...")
     try:
-        dest_entity = await bot.get_entity(DEST_GROUP)
+        dest_entity = await bot.get_entity(int(DEST_GROUP))
         logger.info(f"✅ Destination: {dest_entity.title}")
     except Exception as e:
         logger.error(f"❌ Destination error: {e}")
