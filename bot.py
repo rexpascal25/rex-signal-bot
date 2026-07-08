@@ -1,5 +1,6 @@
 from keep_alive import keep_alive
 keep_alive()
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import asyncio
@@ -65,9 +66,8 @@ async def keepalive(client):
 async def run_bot():
     logger.info("🚀 Starting Rex Signal Bot...")
 
-    # Validate env vars
     if not all([API_ID, API_HASH, BOT_TOKEN, SOURCE_GROUP, DEST_GROUP, SESSION_STRING]):
-        logger.error("❌ Missing environment variables! Check Render Environment tab.")
+        logger.error("❌ Missing environment variables! Check Railway Variables tab.")
         return False
 
     userbot = TelegramClient(
@@ -102,7 +102,7 @@ async def run_bot():
         return False
 
     if not await userbot.is_user_authorized():
-        logger.error("❌ SESSION_STRING is invalid or expired! Generate a new one.")
+        logger.error("❌ SESSION_STRING is invalid or expired!")
         await userbot.disconnect()
         return False
 
@@ -119,7 +119,7 @@ async def run_bot():
         await userbot.disconnect()
         return False
 
-    # ── Resolve source & destination ────────────────────────────
+    # ── Resolve source group ────────────────────────────────────
     logger.info("📥 Finding source group...")
     try:
         source_entity = await userbot.get_entity(SOURCE_GROUP)
@@ -130,9 +130,10 @@ async def run_bot():
         await bot.disconnect()
         return False
 
+    # ── Resolve destination group ───────────────────────────────
     logger.info("📤 Finding destination group...")
     try:
-        dest_entity = await bot.get_entity(int(DEST_GROUP))
+        dest_entity = await userbot.get_entity(int(DEST_GROUP))
         logger.info(f"✅ Destination: {dest_entity.title}")
     except Exception as e:
         logger.error(f"❌ Destination error: {e}")
@@ -152,13 +153,13 @@ async def run_bot():
             logger.info("🚨 Signal detected! Forwarding...")
             try:
                 if message.media:
-                    await bot.send_file(
+                    await userbot.send_file(
                         dest_entity,
                         file=message.media,
                         caption=text
                     )
                 else:
-                    await bot.send_message(dest_entity, text)
+                    await userbot.send_message(dest_entity, text)
                 logger.info("✅ Forwarded successfully!")
             except Exception as e:
                 logger.error(f"❌ Forward error: {e}")
