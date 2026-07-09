@@ -23,36 +23,116 @@ SOURCE_GROUP   = os.environ.get('SOURCE_GROUP', '')
 DEST_GROUP     = os.environ.get('DEST_GROUP', '')
 SESSION_STRING = os.environ.get('SESSION_STRING', '')
 
-# ── Signal keywords ─────────────────────────────────────────────
-SIGNAL_KEYWORDS = [
-    'BUY', 'SELL', 'PUT', 'CALL', 'SIGNAL', 'ENTRY',
-    'EXPIRATION', 'MARTINGALE', 'WIN', 'OTC', 'GBP',
-    'USD', 'EUR', 'DIRECT WIN', 'INSTANT EXECUTION',
-    'DO BUY', '🟥', '🟩', '⏺', '🕘', '✅', '1️⃣', '2️⃣', '3️⃣'
+# ── Ignore keywords ─────────────────────────────────────────────
+IGNORE_KEYWORDS = [
+    'isaac godwin',
+    '@isaacgodwiin',
+    'one on one training',
+    'one on one',
+    'contact me',
+    'limited slots',
+    'account management',
+    'earn daily revenue',
+    'pocket partner',
+    'join one on one',
+    'direct access to the signal source',
+    'are you ready to trade',
+    'contact_me',
+    'training',
+    'met me',
+    'meet me',
 ]
 
-PROFIT_KEYWORDS = [
-    'screenshot', 'profit', 'screenshots',
-    'win at', 'win ✅', '✅ win',
-    'instant execution', 'do buy in'
-]
+# ── Should ignore? ──────────────────────────────────────────────
+def should_ignore(text):
+    if not text:
+        return False
+    text_lower = text.lower()
+    for keyword in IGNORE_KEYWORDS:
+        if keyword.lower() in text_lower:
+            return True
+    return False
 
-# ── Signal detection ────────────────────────────────────────────
-def is_signal_message(text):
+# ── Is confirmation? ────────────────────────────────────────────
+def is_confirmation(text):
+    if not text:
+        return False
+    text_upper = text.upper()
+    keywords = [
+        'WIN AT DIRECT',
+        'WIN AT M1',
+        'WIN AT M2', 
+        'WIN AT M3',
+        'WIN ✅',
+        '✅ WIN',
+        'DIRECT WIN',
+        'WIN IN',
+        'WIN AT',
+        'LOSS',
+        'LOSE',
+    ]
+    for k in keywords:
+        if k.upper() in text_upper:
+            return True
+    return False
+
+# ── Extract OTC pair ────────────────────────────────────────────
+def extract_pair(text):
+    if not text:
+        return ''
+    match = re.search(r'[A-Z]{3}/[A-Z]{3}', text.upper())
+    if match:
+        return match.group(0)
+    return ''
+
+# ── Is trading signal? ──────────────────────────────────────────
+def is_signal(text):
     if not text:
         return False
     text_upper = text.upper()
     if re.search(r'[A-Z]{3}/[A-Z]{3}', text_upper):
         return True
-    for keyword in SIGNAL_KEYWORDS:
-        if keyword.upper() in text_upper:
-            return True
-    for keyword in PROFIT_KEYWORDS:
-        if keyword.upper() in text_upper:
+    signal_keywords = [
+        'BUY', 'SELL', 'PUT', 'CALL',
+        'ENTRY', 'EXPIRATION', 'OTC',
+        'MARTINGALE', '🟥', '🟩',
+    ]
+    for k in signal_keywords:
+        if k in text_upper:
             return True
     return False
 
-# ── Keepalive ping every 4 minutes ─────────────────────────────
+# ── Format messages ─────────────────────────────────────────────
+def format_signal(text):
+    return (
+        f"⚡️ REX SIGNAL ALERTS ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"{text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 @RexSignalAlerts"
+    )
+
+def format_confirmation(text, pair=''):
+    pair_line = f"🔰 {pair} OTC\n" if pair else ''
+    return (
+        f"✅ RESULT UPDATE\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"{pair_line}"
+        f"{text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 @RexSignalAlerts"
+    )
+
+def format_general(text):
+    return (
+        f"📢 REX SIGNAL ALERTS\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"{text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 @RexSignalAlerts"
+    )
+
+# ── Keepalive ───────────────────────────────────────────────────
 async def keepalive(client):
     while True:
         try:
@@ -67,7 +147,7 @@ async def run_bot():
     logger.info("🚀 Starting Rex Signal Bot...")
 
     if not all([API_ID, API_HASH, BOT_TOKEN, SOURCE_GROUP, DEST_GROUP, SESSION_STRING]):
-        logger.error("❌ Missing environment variables! Check Railway Variables tab.")
+        logger.error("❌ Missing environment variables!")
         return False
 
     userbot = TelegramClient(
@@ -82,13 +162,8 @@ async def run_bot():
         app_version="1.0"
     )
 
-    bot = TelegramClient(
-        'bot_session',
-        API_ID,
-        API_HASH
-    )
+    bot = TelegramClient('bot_session', API_ID, API_HASH)
 
-    # ── Connect userbot ─────────────────────────────────────────
     logger.info("🔌 Connecting userbot...")
     try:
         await asyncio.wait_for(userbot.connect(), timeout=60)
@@ -102,14 +177,13 @@ async def run_bot():
         return False
 
     if not await userbot.is_user_authorized():
-        logger.error("❌ SESSION_STRING is invalid or expired!")
+        logger.error("❌ SESSION_STRING expired!")
         await userbot.disconnect()
         return False
 
     me = await userbot.get_me()
     logger.info(f"✅ Userbot authorized as: {me.first_name} (@{me.username})")
 
-    # ── Start bot ───────────────────────────────────────────────
     logger.info("🔌 Starting bot...")
     try:
         await bot.start(bot_token=BOT_TOKEN)
@@ -119,7 +193,6 @@ async def run_bot():
         await userbot.disconnect()
         return False
 
-    # ── Resolve source group ────────────────────────────────────
     logger.info("📥 Finding source group...")
     try:
         source_entity = await userbot.get_entity(SOURCE_GROUP)
@@ -130,7 +203,6 @@ async def run_bot():
         await bot.disconnect()
         return False
 
-    # ── Resolve destination group ───────────────────────────────
     logger.info("📤 Finding destination group...")
     try:
         dest_entity = await userbot.get_entity(int(DEST_GROUP))
@@ -149,24 +221,55 @@ async def run_bot():
         preview = text[:40].replace('\n', ' ')
         logger.info(f"📨 New message: {preview}...")
 
-        if is_signal_message(text):
-            logger.info("🚨 Signal detected! Forwarding...")
-            try:
-                if message.media:
-                    await userbot.send_file(
-                        dest_entity,
-                        file=message.media,
-                        caption=text
-                    )
-                else:
-                    await userbot.send_message(dest_entity, text)
-                logger.info("✅ Forwarded successfully!")
-            except Exception as e:
-                logger.error(f"❌ Forward error: {e}")
-        else:
-            logger.info("⏭️ Not a signal, skipping")
+        # Ignore promotional messages
+        if should_ignore(text):
+            logger.info("🚫 Promotional — ignoring")
+            return
 
-    # ── Start keepalive & run ───────────────────────────────────
+        try:
+            # Confirmation message
+            if is_confirmation(text):
+                pair = ''
+                if message.reply_to_msg_id:
+                    try:
+                        replied = await userbot.get_messages(
+                            source_entity,
+                            ids=message.reply_to_msg_id
+                        )
+                        if replied:
+                            pair = extract_pair(
+                                replied.text or replied.caption or ''
+                            )
+                    except Exception:
+                        pass
+                formatted = format_confirmation(text, pair)
+
+            # Trading signal
+            elif is_signal(text):
+                formatted = format_signal(text)
+
+            # General message
+            else:
+                formatted = format_general(text)
+
+            # Send message
+            if message.media:
+                await userbot.send_file(
+                    dest_entity,
+                    file=message.media,
+                    caption=formatted
+                )
+            else:
+                await userbot.send_message(
+                    dest_entity,
+                    formatted
+                )
+
+            logger.info("✅ Forwarded successfully!")
+
+        except Exception as e:
+            logger.error(f"❌ Forward error: {e}")
+
     logger.info("🤖 Rex Signal Bot is LIVE! Listening for signals...")
     asyncio.create_task(keepalive(userbot))
     await userbot.run_until_disconnected()
