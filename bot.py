@@ -143,12 +143,34 @@ def is_signal(text):
             return True
     return False
 
+# ── Add 🔴🟢 to signal execution lines ────────────────────────
+def add_execution_emoji(text):
+    lines     = text.split('\n')
+    new_lines = []
+    for line in lines:
+        line_upper = line.upper()
+        if re.search(r'(BUY|SELL|CALL|PUT|INSTANT EXECUTION).*(IN\s*\d+\s*MIN|INSTANT)', line_upper):
+            if '🟢' not in line and '🔴' not in line:
+                if any(k in line_upper for k in ['BUY', 'CALL']):
+                    line = f"{line} 🟢"
+                elif any(k in line_upper for k in ['SELL', 'PUT']):
+                    line = f"{line} 🔴"
+                elif 'INSTANT' in line_upper:
+                    direction = get_signal_direction(text)
+                    if direction == 'buy':
+                        line = f"{line} 🟢"
+                    elif direction == 'sell':
+                        line = f"{line} 🔴"
+        new_lines.append(line)
+    return '\n'.join(new_lines)
+
 # ── Format messages ─────────────────────────────────────────────
 def format_signal(text):
+    text_with_emoji = add_execution_emoji(text)
     return (
         f"⚡️ REX SIGNAL ALERTS ⚡️\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"{text}\n\n"
+        f"{text_with_emoji}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 @RexSignalAlerts"
     )
