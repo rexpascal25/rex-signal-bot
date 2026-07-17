@@ -23,6 +23,11 @@ SOURCE_GROUP   = os.environ.get('SOURCE_GROUP', '')
 DEST_GROUP     = os.environ.get('DEST_GROUP', '')
 SESSION_STRING = os.environ.get('SESSION_STRING', '')
 
+# ── Message ID mapping (source msg id → dest msg id) ──────────
+# Used for edit detection
+message_map = {}  # {source_msg_id: dest_msg_id}
+signal_direction_map = {}  # {source_msg_id: 'buy' or 'sell'}
+
 # ── Ignore keywords ─────────────────────────────────────────────
 IGNORE_KEYWORDS = [
     'isaac godwin',
@@ -43,7 +48,6 @@ IGNORE_KEYWORDS = [
     'meet me',
 ]
 
-# ── Should ignore? ──────────────────────────────────────────────
 def should_ignore(text):
     if not text:
         return False
@@ -53,28 +57,65 @@ def should_ignore(text):
             return True
     return False
 
-# ── Is confirmation? ────────────────────────────────────────────
+# ── Detect signal direction ────────────────────────────────────
+def get_signal_direction(text):
+    if not text:
+        return None
+    text_upper = text.upper()
+    if any(k in text_upper for k in ['BUY', 'CALL', '🟩']):
+        return 'buy'
+    elif any(k in text_upper for k in ['SELL', 'PUT', '🟥']):
+        return 'sell'
+    return None
+
+# ── Is confirmation/win? ────────────────────────────────────────
 def is_confirmation(text):
     if not text:
         return False
     text_upper = text.upper()
     keywords = [
-        'WIN AT DIRECT',
-        'WIN AT M1',
-        'WIN AT M2', 
-        'WIN AT M3',
-        'WIN ✅',
-        '✅ WIN',
-        'DIRECT WIN',
-        'WIN IN',
-        'WIN AT',
-        'LOSS',
-        'LOSE',
+        'WIN AT DIRECT', 'WIN AT M1', 'WIN AT M2',
+        'WIN AT M3', 'WIN ✅', '✅ WIN', 'DIRECT WIN',
+        'WIN IN', 'WIN AT', 'LOSS', 'LOSE',
     ]
     for k in keywords:
         if k.upper() in text_upper:
             return True
     return False
+
+def is_win(text):
+    if not text:
+        return False
+    text_upper = text.upper()
+    win_keywords = [
+        'WIN AT DIRECT', 'WIN AT M1', 'WIN AT M2',
+        'WIN AT M3', 'WIN ✅', '✅ WIN', 'DIRECT WIN',
+        'WIN IN', 'WIN AT',
+    ]
+    for k in win_keywords:
+        if k in text_upper:
+            return True
+    return False
+
+# ── Add win emoji based on direction ──────────────────────────
+def add_win_emoji(text, direction):
+    if not is_win(text):
+        return text
+    if direction == 'buy':
+        emoji = '🟢'
+    elif direction == 'sell':
+        emoji = '🔴'
+    else:
+        emoji = '🔴🟢'
+    # Add emoji at end of win line
+    lines = text.split('\n')
+    new_lines = []
+    for line in lines:
+        line_upper = line.upper()
+        if any(k in line_upper for k in ['WIN AT', 'WIN IN', 'DIRECT WIN', '✅ WIN', 'WIN ✅']):
+            line = f"{line} {emoji}"
+        new_lines.append(line)
+    return '\n'.join(new_lines)
 
 # ── Extract OTC pair ────────────────────────────────────────────
 def extract_pair(text):
@@ -112,13 +153,15 @@ def format_signal(text):
         f"📊 @RexSignalAlerts"
     )
 
-def format_confirmation(text, pair=''):
-    pair_line = f"🔰 {pair} OTC\n" if pair else ''
+def format_confirmation(text, pair='', direction=None):
+    pair_line  = f"🔰 {pair} OTC\n" if pair else ''
+    # Add win emoji based on direction
+    text_with_emoji = add_win_emoji(text, direction)
     return (
         f"✅ RESULT UPDATE\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"{pair_line}"
-        f"{text}\n\n"
+        f"{text_with_emoji}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 @RexSignalAlerts"
     )
@@ -213,21 +256,88 @@ async def run_bot():
         await bot.disconnect()
         return False
 
-    # ── Message handler ─────────────────────────────────────────
+    # ── NEW MESSAGE Handler ────────────────────────────────────
     @userbot.on(events.NewMessage(chats=source_entity))
     async def handler(event):
         message = event.message
-        text = message.text or message.caption or ''
+        text    = message.text or message.caption or ''
         preview = text[:40].replace('\n', ' ')
         logger.info(f"📨 New message: {preview}...")
 
-        # Ignore promotional messages
         if should_ignore(text):
             logger.info("🚫 Promotional — ignoring")
             return
 
         try:
-            # Confirmation message
+            direction = get_signal_direction(text)
+
+            if is_confirmation(text):
+                pair = ''
+                # Try to get direction from replied signal
+                if message.reply_to_msg_id:
+                    try:
+                        replied = await userbot.get_messages(
+                            source_entity,
+                            ids=message.reply_to_msg_id
+                        )
+                        if replied:
+                            pair = extract_pair(replied.text or replied.caption or '')
+                            # Get direction from original signal
+                            orig_dir = signal_direction_map.get(message.reply_to_msg_id)
+                            if orig_dir:
+                                direction = orig_dir
+                    except Exception:
+                        pass
+                formatted = format_confirmation(text, pair, direction)
+
+            elif is_signal(text):
+                formatted = format_signal(text)
+                # Save direction for this signal
+                if direction:
+                    signal_direction_map[message.id] = direction
+
+            else:
+                formatted = format_general(text)
+
+            # Send message and save ID mapping
+            if message.media:
+                sent = await userbot.send_file(
+                    dest_entity,
+                    file=message.media,
+                    caption=formatted
+                )
+            else:
+                sent = await userbot.send_message(
+                    dest_entity,
+                    formatted
+                )
+
+            # Save message ID mapping for edit detection
+            message_map[message.id] = sent.id
+            logger.info(f"✅ Forwarded! {message.id} → {sent.id}")
+
+        except Exception as e:
+            logger.error(f"❌ Forward error: {e}")
+
+    # ── EDIT MESSAGE Handler (NEW!) ────────────────────────────
+    @userbot.on(events.MessageEdited(chats=source_entity))
+    async def edit_handler(event):
+        message = event.message
+        text    = message.text or message.caption or ''
+        logger.info(f"✏️ Message edited in source: {message.id}")
+
+        # Check if we have the corresponding dest message
+        dest_msg_id = message_map.get(message.id)
+        if not dest_msg_id:
+            logger.info("⚠️ No mapping found for edited message, skipping")
+            return
+
+        if should_ignore(text):
+            return
+
+        try:
+            direction = signal_direction_map.get(message.id)
+
             if is_confirmation(text):
                 pair = ''
                 if message.reply_to_msg_id:
@@ -237,44 +347,36 @@ async def run_bot():
                             ids=message.reply_to_msg_id
                         )
                         if replied:
-                            pair = extract_pair(
-                                replied.text or replied.caption or ''
-                            )
-                    except Exception:
-                        pass
-                formatted = format_confirmation(text, pair)
+                            pair = extract_pair(replied.text or replied.caption or '')
+                            orig_dir = signal_direction_map.get(message.reply_to_msg_id)
+                            if orig_dir:
+                                direction = orig_dir
+                    except: pass
+                formatted = format_confirmation(text, pair, direction)
 
-            # Trading signal
             elif is_signal(text):
                 formatted = format_signal(text)
+                if get_signal_direction(text):
+                    signal_direction_map[message.id] = get_signal_direction(text)
 
-            # General message
             else:
                 formatted = format_general(text)
 
-            # Send message
-            if message.media:
-                await userbot.send_file(
-                    dest_entity,
-                    file=message.media,
-                    caption=formatted
-                )
-            else:
-                await userbot.send_message(
-                    dest_entity,
-                    formatted
-                )
-
-            logger.info("✅ Forwarded successfully!")
+            # Edit the destination message
+            await userbot.edit_message(
+                dest_entity,
+                dest_msg_id,
+                formatted
+            )
+            logger.info(f"✅ Edit synced! Source {message.id} → Dest {dest_msg_id}")
 
         except Exception as e:
-            logger.error(f"❌ Forward error: {e}")
+            logger.error(f"❌ Edit sync error: {e}")
 
     logger.info("🤖 Rex Signal Bot is LIVE! Listening for signals...")
     asyncio.create_task(keepalive(userbot))
     await userbot.run_until_disconnected()
     return True
-
 
 # ── Auto-restart wrapper ────────────────────────────────────────
 async def main():
@@ -285,7 +387,6 @@ async def main():
             logger.error(f"💥 Bot crashed: {e}")
         logger.warning("🔄 Restarting in 30 seconds...")
         await asyncio.sleep(30)
-
 
 if __name__ == '__main__':
     asyncio.run(main())
