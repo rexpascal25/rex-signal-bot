@@ -61,23 +61,46 @@ PROMO_KEYWORDS = [
     'met me', 'meet me',
 ]
 
-# ── Replacement messages (alternate between them) ──────────────
-PROMO_REPLACEMENTS = [
-    "📌 The next signals will drop by 11 am tomorrow ⏰️",
-    "📌 Next signals will drop by 5pm today ⏰️⏰️",
-]
-promo_index = [0]
-
-def get_next_replacement():
-    msg = PROMO_REPLACEMENTS[promo_index[0]]
-    promo_index[0] = (promo_index[0] + 1) % len(PROMO_REPLACEMENTS)
-    return msg
-
 def is_promo_message(text):
     if not text:
         return False
     text_lower = text.lower()
     return any(k in text_lower for k in PROMO_KEYWORDS)
+
+def extract_signal_time_from_promo(text):
+    """
+    Extract the real signal time announcement buried
+    inside the promotional message and return it cleanly.
+
+    Examples:
+    "Next signals will drop by 5pm today" 
+        → "📌 Next signals will drop by 5pm today ⏰️"
+    "Next signals will drop by 11am tomorrow"
+        → "📌 Next signals will drop by 11am tomorrow ⏰️"
+    """
+    if not text:
+        return "📌 Stay tuned for the next signals ⏰️"
+
+    lines = text.split('\n')
+    for line in lines:
+        line_clean = line.strip()
+        line_lower = line_clean.lower()
+
+        # Look for lines containing signal time info
+        if 'next signals will drop' in line_lower or            'signals will drop' in line_lower or            'signal will drop' in line_lower:
+
+            # Clean up the line — remove bullet points/icons
+            line_clean = re.sub(r'^[📌✔️🎉•\-\s]+', '', line_clean).strip()
+
+            # Add ⏰ if not already there
+            if '⏰' not in line_clean:
+                line_clean = f"{line_clean} ⏰️"
+
+            # Add 📌 prefix
+            return f"📌 {line_clean}"
+
+    # Default if no time found in promo
+    return "📌 Stay tuned for the next signals ⏰️"
 
 # ── Signal detection ────────────────────────────────────────────
 def is_signal_message(text):
@@ -327,7 +350,8 @@ async def run_bot():
         # ── Handle promotional messages ─────────────────────────
         if is_promo_message(text):
             try:
-                replacement = get_next_replacement()
+                # Extract real signal time from promo
+                replacement = extract_signal_time_from_promo(text)
                 sent = await bot.send_message(dest_entity, replacement)
                 message_map[message.id] = sent.id
                 logger.info(f"🔄 Promo replaced with: {replacement}")
