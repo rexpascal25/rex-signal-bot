@@ -41,11 +41,53 @@ PROFIT_KEYWORDS = [
     'instant execution', 'do buy in'
 ]
 
+# ── Extra messages to forward ───────────────────────────────────
+FORWARD_KEYWORDS = [
+    'good morning', 'good evening', 'good afternoon',
+    'good night', 'i hope you are doing good',
+    "we'll trade", 'we will trade', 'lost',
+    'cannot stress', 'next signals will drop',
+    'signals will drop',
+]
+
+# ── Promotional keywords to REPLACE ────────────────────────────
+PROMO_KEYWORDS = [
+    'one on one', 'contact me', 'limited slots',
+    'account management', 'pocket partner',
+    'earn daily revenue', 'join one on one',
+    'direct access to the signal source',
+    'are you ready to trade', 'contact_me',
+    'isaac godwin', '@isaacgodwiin',
+    'met me', 'meet me',
+]
+
+# ── Replacement messages (alternate between them) ──────────────
+PROMO_REPLACEMENTS = [
+    "📌 The next signals will drop by 11 am tomorrow ⏰️",
+    "📌 Next signals will drop by 5pm today ⏰️⏰️",
+]
+promo_index = [0]
+
+def get_next_replacement():
+    msg = PROMO_REPLACEMENTS[promo_index[0]]
+    promo_index[0] = (promo_index[0] + 1) % len(PROMO_REPLACEMENTS)
+    return msg
+
+def is_promo_message(text):
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(k in text_lower for k in PROMO_KEYWORDS)
+
 # ── Signal detection ────────────────────────────────────────────
 def is_signal_message(text):
     if not text:
         return False
+    text_lower = text.lower()
     text_upper = text.upper()
+    # Forward greetings and general messages
+    if any(k in text_lower for k in FORWARD_KEYWORDS):
+        return True
     if re.search(r'[A-Z]{3}/[A-Z]{3}', text_upper):
         return True
     for keyword in SIGNAL_KEYWORDS:
@@ -74,20 +116,37 @@ def direction_emoji(direction):
         return '🔴'
     return ''
 
-# ── Add emoji to greeting lines ────────────────────────────────
+# ── Add emoji to greeting and general lines ───────────────────
 def process_greeting(text):
-    greetings = [
-        'good morning', 'good evening', 'good afternoon',
-        'good night', 'hello everyone', 'hi everyone',
-        'good morning everyone', 'good evening everyone'
-    ]
     lines     = text.split('\n')
     new_lines = []
     for line in lines:
         line_lower = line.lower().strip()
-        if any(g in line_lower for g in greetings):
+        line_upper = line.upper()
+
+        # Good morning/evening → 👋
+        if any(g in line_lower for g in [
+            'good morning', 'good evening', 'good afternoon',
+            'good night', 'hello everyone', 'hi everyone'
+        ]):
             if '👋' not in line:
                 line = f"{line} 👋"
+
+        # I hope you are doing good → 🎊
+        elif 'i hope you are doing good' in line_lower:
+            if '🎊' not in line:
+                line = f"{line} 🎊"
+
+        # We'll trade / We will trade → ⏰
+        elif any(k in line_lower for k in ["we'll trade", 'we will trade']):
+            if '⏰' not in line:
+                line = f"{line} ⏰"
+
+        # Lost / cannot stress → ❌
+        elif any(k in line_lower for k in ['lost', 'cannot stress']):
+            if '❌' not in line:
+                line = f"{line} ❌"
+
         new_lines.append(line)
     return '\n'.join(new_lines)
 
@@ -264,6 +323,17 @@ async def run_bot():
         text    = message.text or message.caption or ''
         preview = text[:50].replace('\n', ' ')
         logger.info(f"📨 New message: {preview}...")
+
+        # ── Handle promotional messages ─────────────────────────
+        if is_promo_message(text):
+            try:
+                replacement = get_next_replacement()
+                sent = await bot.send_message(dest_entity, replacement)
+                message_map[message.id] = sent.id
+                logger.info(f"🔄 Promo replaced with: {replacement}")
+            except Exception as e:
+                logger.error(f"❌ Promo replace error: {e}")
+            return
 
         if not is_signal_message(text):
             logger.info("⏭️ Not a signal, skipping")
