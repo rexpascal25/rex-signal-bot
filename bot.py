@@ -45,9 +45,9 @@ PROFIT_KEYWORDS = [
 FORWARD_KEYWORDS = [
     'good morning', 'good evening', 'good afternoon',
     'good night', 'i hope you are doing good',
-    "we'll trade", 'we will trade', 'lost',
-    'cannot stress', 'next signals will drop',
-    'signals will drop',
+    "we'll trade", 'we will trade', "let's trade",
+    'lets trade', 'lost', 'cannot stress',
+    'next signals will drop', 'signals will drop',
 ]
 
 # ── Promotional keywords to REPLACE ────────────────────────────
@@ -160,8 +160,8 @@ def process_greeting(text):
             if '🎊' not in line:
                 line = f"{line} 🎊"
 
-        # We'll trade / We will trade → ⏰
-        elif any(k in line_lower for k in ["we'll trade", 'we will trade']):
+        # We'll trade / We will trade / Let's trade → ⏰
+        elif any(k in line_lower for k in ["we'll trade", 'we will trade', "let's trade", 'lets trade']):
             if '⏰' not in line:
                 line = f"{line} ⏰"
 
