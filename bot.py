@@ -34,7 +34,8 @@ SIGNAL_KEYWORDS = [
     'USD', 'EUR', 'DIRECT WIN', 'INSTANT EXECUTION',
     'DO BUY', '🟥', '🟩', '⏺', '🕘', '✅', '1️⃣', '2️⃣', '3️⃣',
     'CALL ✅', 'BUY ✅', 'SELL ✅', 'PUT ✅',
-    'AT INSTANT EXECUTION',
+    'AT INSTANT EXECUTION', 'WIN ✅',
+    'WIN AT', 'WIN IN',
 ]
 
 PROFIT_KEYWORDS = [
@@ -357,7 +358,6 @@ async def run_bot():
         # ── Handle promotional messages ─────────────────────────
         if is_promo_message(text):
             try:
-                # Extract real signal time from promo
                 replacement = extract_signal_time_from_promo(text)
                 sent = await bot.send_message(dest_entity, replacement)
                 message_map[message.id] = sent.id
@@ -365,6 +365,32 @@ async def run_bot():
             except Exception as e:
                 logger.error(f"❌ Promo replace error: {e}")
             return
+
+        # ── Always forward media messages with WIN/result captions
+        if message.media and text:
+            text_upper = text.upper()
+            # Force forward if caption contains WIN keywords
+            force_forward = any(k in text_upper for k in [
+                'WIN ✅', '✅ WIN', 'WIN AT', 'INSTANT EXECUTION',
+                'WIN IN', 'DIRECT WIN', 'WIN AT M'
+            ])
+            if force_forward:
+                logger.info("📸 Media with WIN caption — force forwarding!")
+                try:
+                    direction = get_direction(text)
+                    processed_caption = process_text(text, direction)
+                    sent = await bot.send_file(
+                        dest_entity,
+                        file=message.media,
+                        caption=processed_caption
+                    )
+                    message_map[message.id] = sent.id
+                    if direction:
+                        signal_direction_map[message.id] = direction
+                    logger.info(f"✅ Media WIN forwarded: {message.id} → {sent.id}")
+                except Exception as e:
+                    logger.error(f"❌ Media WIN forward error: {e}")
+                return
 
         if not is_signal_message(text):
             logger.info("⏭️ Not a signal, skipping")
