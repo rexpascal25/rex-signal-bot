@@ -379,7 +379,8 @@ async def run_bot():
                 try:
                     direction = get_direction(text)
                     processed_caption = process_text(text, direction)
-                    sent = await bot.send_file(
+                    # Use userbot to forward media (bot can't access source media)
+                    sent = await userbot.send_file(
                         dest_entity,
                         file=message.media,
                         caption=processed_caption
@@ -417,13 +418,11 @@ async def run_bot():
 
             # Send message
             if message.media:
-                # For media messages — get caption and process it
+                # For media messages — use userbot to access source media
                 caption     = message.caption or ''
-                # Detect direction from caption if not found in text
                 cap_dir = direction or get_direction(caption)
-                # Process caption with emojis
                 processed_caption = process_text(caption, cap_dir) if caption else ''
-                sent = await bot.send_file(
+                sent = await userbot.send_file(
                     dest_entity,
                     file=message.media,
                     caption=processed_caption or processed_text
