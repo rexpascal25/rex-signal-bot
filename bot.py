@@ -32,7 +32,9 @@ SIGNAL_KEYWORDS = [
     'BUY', 'SELL', 'PUT', 'CALL', 'SIGNAL', 'ENTRY',
     'EXPIRATION', 'MARTINGALE', 'WIN', 'OTC', 'GBP',
     'USD', 'EUR', 'DIRECT WIN', 'INSTANT EXECUTION',
-    'DO BUY', '🟥', '🟩', '⏺', '🕘', '✅', '1️⃣', '2️⃣', '3️⃣'
+    'DO BUY', '🟥', '🟩', '⏺', '🕘', '✅', '1️⃣', '2️⃣', '3️⃣',
+    'CALL ✅', 'BUY ✅', 'SELL ✅', 'PUT ✅',
+    'AT INSTANT EXECUTION',
 ]
 
 PROFIT_KEYWORDS = [
@@ -126,8 +128,10 @@ def get_direction(text):
     if not text:
         return None
     text_upper = text.upper()
+    # Check for BUY/CALL indicators
     if any(k in text_upper for k in ['BUY', 'CALL', '🟩', 'DO BUY']):
         return 'buy'
+    # Check for SELL/PUT indicators
     elif any(k in text_upper for k in ['SELL', 'PUT', '🟥', 'DO SELL']):
         return 'sell'
     return None
@@ -228,6 +232,10 @@ def process_result_emojis(text, direction):
         'WIN AT DIRECT', 'WIN AT M1', 'WIN AT M2', 'WIN AT M3',
         'WIN AT INSTANT', 'WIN ✅', '✅ WIN', 'DIRECT WIN',
         'WIN IN', 'WIN AT',
+        # ── Instant execution variants ──
+        'AT INSTANT EXECUTION',
+        'INSTANT EXECUTION',
+        'WIN ✅ AT INSTANT',
     ]
 
     for line in lines:
@@ -258,9 +266,8 @@ def process_text(text, direction=None):
     # Apply signal execution emoji
     text = process_signal_emojis(text)
 
-    # Apply win result emoji
-    if direction:
-        text = process_result_emojis(text, direction)
+    # Apply win result emoji (always run to catch all patterns)
+    text = process_result_emojis(text, direction)
 
     return text
 
@@ -384,10 +391,16 @@ async def run_bot():
 
             # Send message
             if message.media:
+                # For media messages — get caption and process it
+                caption     = message.caption or ''
+                # Detect direction from caption if not found in text
+                cap_dir = direction or get_direction(caption)
+                # Process caption with emojis
+                processed_caption = process_text(caption, cap_dir) if caption else ''
                 sent = await bot.send_file(
                     dest_entity,
                     file=message.media,
-                    caption=processed_text
+                    caption=processed_caption or processed_text
                 )
             else:
                 sent = await bot.send_message(
