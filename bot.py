@@ -2,6 +2,7 @@ from keep_alive import keep_alive
 keep_alive()
 
 from telethon import TelegramClient, events
+from telethon import Button
 from telethon.sessions import StringSession
 import asyncio
 import re
@@ -71,16 +72,6 @@ def is_promo_message(text):
     return any(k in text_lower for k in PROMO_KEYWORDS)
 
 def extract_signal_time_from_promo(text):
-    """
-    Extract the real signal time announcement buried
-    inside the promotional message and return it cleanly.
-
-    Examples:
-    "Next signals will drop by 5pm today" 
-        → "📌 Next signals will drop by 5pm today ⏰️"
-    "Next signals will drop by 11am tomorrow"
-        → "📌 Next signals will drop by 11am tomorrow ⏰️"
-    """
     if not text:
         return "📌 Stay tuned for the next signals ⏰️"
 
@@ -89,20 +80,17 @@ def extract_signal_time_from_promo(text):
         line_clean = line.strip()
         line_lower = line_clean.lower()
 
-        # Look for lines containing signal time info
-        if 'next signals will drop' in line_lower or            'signals will drop' in line_lower or            'signal will drop' in line_lower:
+        if 'next signals will drop' in line_lower or \
+           'signals will drop' in line_lower or \
+           'signal will drop' in line_lower:
 
-            # Clean up the line — remove bullet points/icons
             line_clean = re.sub(r'^[📌✔️🎉•\-\s]+', '', line_clean).strip()
 
-            # Add ⏰ if not already there
             if '⏰' not in line_clean:
                 line_clean = f"{line_clean} ⏰️"
 
-            # Add 📌 prefix
             return f"📌 {line_clean}"
 
-    # Default if no time found in promo
     return "📌 Stay tuned for the next signals ⏰️"
 
 # ── Signal detection ────────────────────────────────────────────
@@ -111,7 +99,6 @@ def is_signal_message(text):
         return False
     text_lower = text.lower()
     text_upper = text.upper()
-    # Forward greetings and general messages
     if any(k in text_lower for k in FORWARD_KEYWORDS):
         return True
     if re.search(r'[A-Z]{3}/[A-Z]{3}', text_upper):
@@ -129,10 +116,8 @@ def get_direction(text):
     if not text:
         return None
     text_upper = text.upper()
-    # Check for BUY/CALL indicators
     if any(k in text_upper for k in ['BUY', 'CALL', '🟩', 'DO BUY']):
         return 'buy'
-    # Check for SELL/PUT indicators
     elif any(k in text_upper for k in ['SELL', 'PUT', '🟥', 'DO SELL']):
         return 'sell'
     return None
@@ -150,9 +135,7 @@ def process_greeting(text):
     new_lines = []
     for line in lines:
         line_lower = line.lower().strip()
-        line_upper = line.upper()
 
-        # Good morning/evening → 👋
         if any(g in line_lower for g in [
             'good morning', 'good evening', 'good afternoon',
             'good night', 'hello everyone', 'hi everyone'
@@ -160,17 +143,14 @@ def process_greeting(text):
             if '👋' not in line:
                 line = f"{line} 👋"
 
-        # I hope you are doing good → 🎊
         elif 'i hope you are doing good' in line_lower:
             if '🎊' not in line:
                 line = f"{line} 🎊"
 
-        # We'll trade / We will trade / Let's trade → ⏰
         elif any(k in line_lower for k in ["we'll trade", 'we will trade', "let's trade", 'lets trade']):
             if '⏰' not in line:
                 line = f"{line} ⏰"
 
-        # Lost / cannot stress → ❌
         elif any(k in line_lower for k in ['lost', 'cannot stress']):
             if '❌' not in line:
                 line = f"{line} ❌"
@@ -180,14 +160,6 @@ def process_greeting(text):
 
 # ── Add emoji to signal execution lines ───────────────────────
 def process_signal_emojis(text):
-    """
-    Add correct emoji to lines like:
-    - BUY in 1 minute → BUY in 1 minute 🟢
-    - SELL in 1 minute → SELL in 1 minute 🔴
-    - Do sell in 1 minute → Do sell in 1 minute 🔴
-    - Do buy in 1 minute → Do buy in 1 minute 🟢
-    - Instant execution in 1 min → depends on signal direction
-    """
     overall_direction = get_direction(text)
     lines     = text.split('\n')
     new_lines = []
@@ -195,7 +167,6 @@ def process_signal_emojis(text):
     for line in lines:
         line_upper = line.upper().strip()
 
-        # Match execution lines
         is_execution_line = bool(re.search(
             r'(DO\s+)?(BUY|SELL|CALL|PUT|INSTANT\s+EXECUTION)'
             r'.*(IN\s*\d+\s*(MIN|MINUTE|MINUTES|SEC|SECOND))',
@@ -203,13 +174,11 @@ def process_signal_emojis(text):
         ))
 
         if is_execution_line:
-            # Determine emoji for this specific line
             if any(k in line_upper for k in ['BUY', 'CALL', 'DO BUY']):
                 emoji = '🟢'
             elif any(k in line_upper for k in ['SELL', 'PUT', 'DO SELL']):
                 emoji = '🔴'
             else:
-                # Instant execution — use overall signal direction
                 emoji = direction_emoji(overall_direction)
 
             if emoji and emoji not in line:
@@ -220,12 +189,6 @@ def process_signal_emojis(text):
 
 # ── Add emoji to win/result lines ─────────────────────────────
 def process_result_emojis(text, direction):
-    """
-    Add correct emoji to lines like:
-    - WIN at DIRECT in 2 Minutes → WIN at DIRECT in 2 Minutes 🟢
-    - WIN at M1 in 2 minutes → WIN at M1 in 2 minutes 🔴
-    - WIN ✅ at instant execution → WIN ✅ at instant execution 🟢
-    """
     lines     = text.split('\n')
     new_lines = []
 
@@ -233,7 +196,6 @@ def process_result_emojis(text, direction):
         'WIN AT DIRECT', 'WIN AT M1', 'WIN AT M2', 'WIN AT M3',
         'WIN AT INSTANT', 'WIN ✅', '✅ WIN', 'DIRECT WIN',
         'WIN IN', 'WIN AT',
-        # ── Instant execution variants ──
         'AT INSTANT EXECUTION',
         'INSTANT EXECUTION',
         'WIN ✅ AT INSTANT',
@@ -244,7 +206,6 @@ def process_result_emojis(text, direction):
         is_win_line = any(p in line_upper for p in WIN_PATTERNS)
 
         if is_win_line:
-            # Check direction in the line itself first
             line_dir = get_direction(line)
             final_dir = line_dir or direction
             emoji = direction_emoji(final_dir)
@@ -257,20 +218,283 @@ def process_result_emojis(text, direction):
 
 # ── Process full message text ──────────────────────────────────
 def process_text(text, direction=None):
-    """Apply all emoji processing to message text"""
     if not text:
         return text
-
-    # Apply greeting emoji
     text = process_greeting(text)
-
-    # Apply signal execution emoji
     text = process_signal_emojis(text)
-
-    # Apply win result emoji (always run to catch all patterns)
     text = process_result_emojis(text, direction)
-
     return text
+
+# ══════════════════════════════════════════════════════════════
+# NEW: Strategy / Materials / Register menu
+# ══════════════════════════════════════════════════════════════
+
+# ── Links (set these as environment variables once you have them) ─
+GOOGLE_DRIVE_LINK   = os.environ.get('GOOGLE_DRIVE_LINK', 'https://example.com/replace-with-your-drive-link')
+POCKET_PARTNER_LINK = os.environ.get('POCKET_PARTNER_LINK', 'https://example.com/replace-with-your-pocket-partner-link')
+
+# Tracks which diagram each user is currently viewing per strategy
+diagram_state = {}
+
+# ── Strategy write-ups + diagrams ──────────────────────────────
+# Add future strategies here — each needs a unique key, a display
+# name (shown in the dropdown button), the text chunks (each kept
+# under Telegram's 4096-char limit), and the diagram list.
+
+ASSETS_DIR = "assets"
+
+TRENDING_STRATEGY_TEXT = [
+    (
+        "🌈 *The Trending Strategy* 📈\n"
+        "_By Pascal Brown_\n\n"
+        "😊 *Big Idea:* We watch which way the market is \"walking\" "
+        "(up or down), and we only join the walk when everyone is "
+        "walking the *same way*. That's it!\n\n"
+        "🕯️ *1. What is a \"Candle\"?*\n"
+        "Every minute, the market draws a little colored block called "
+        "a candle.\n"
+        "🟢 Green candle = price went UP that minute ⬆️\n"
+        "🔴 Red candle = price went DOWN that minute ⬇️\n\n"
+        "Every candle here is *1 minute* long — it opens, runs for 60 "
+        "seconds, closes, and a new one opens right away. ⏱️"
+    ),
+    (
+        "🧰 *2. The Toolbox We Use*\n\n"
+        "🎯 *The \"Marker\" (oscillator):* a wiggly line that shows when "
+        "the market is \"too tired\" going up (overbought) or down "
+        "(oversold).\n\n"
+        "📈 *MACD:* shows how strong the push is — a steep, straight "
+        "line means the move is strong and confident.\n\n"
+        "📏 *Two Moving Averages* (green + yellow): smooth lines that "
+        "show the market's average mood.\n\n"
+        "👆 Above the yellow line = BUY mood. Below it = SELL mood."
+    ),
+    (
+        "🛤️ *3. The MOST Important Rule: Trend vs. Range*\n\n"
+        "💎 This is the heart of the whole strategy. We only play when "
+        "the market is *trending* — candles keep matching colors in a "
+        "row, like friends all walking the same way.\n\n"
+        "🌀 If candles keep flip-flopping (green, red, green, red...), "
+        "that's *ranging* — never play in a ranging market, you can't "
+        "guess what happens next.\n\n"
+        "🔍 *How to spot it:* look at the last few candles.\n"
+        "✅ All matching colors → trend, safe to play.\n"
+        "❌ Mixed colors → range, walk away and find another pair."
+    ),
+    (
+        "🐾 *4. Step-by-Step: How a Trade is Taken*\n\n"
+        "1️⃣ Look at candles — are they all matching?\n"
+        "2️⃣ Trending? YES → keep going. NO → skip this market.\n"
+        "3️⃣ Check the yellow line — above = buy mood, below = sell mood.\n"
+        "4️⃣ Wait for the candle to close, note its color.\n"
+        "5️⃣ New candle opens → enter in the *same* direction.\n"
+        "6️⃣ Win? Repeat 4–5. Lose? Martingale once, new direction.\n"
+        "7️⃣ See mixed colors? STOP — it's ranging, find another market."
+    ),
+    (
+        "🎲 *5. What Happens if a Trade Loses? (Martingale)*\n\n"
+        "When a trade loses, this strategy says: put in a *bigger bet* "
+        "on the very next candle, following the new color. This is "
+        "called *martingale*.\n\n"
+        "🤔 If you guess wrong once, you guess again but risk a little "
+        "more, hoping to win back what you lost plus a little extra.\n\n"
+        "🚨 *Caution:* martingale can grow your risk very fast across "
+        "several losses in a row — even in a market that looks like "
+        "it's trending. Be extra careful with it, no matter how "
+        "experienced you are."
+    ),
+    (
+        "🔍 *6. Finding Today's Best Trending OTC Pair*\n\n"
+        "🤔 No OTC pair trends all day, every day. A pair that trends "
+        "beautifully in the morning can turn choppy an hour later — "
+        "and a different pair might start trending instead. Trending "
+        "is a *temporary mood*, not a permanent label.\n\n"
+        "So the winning habit is to *scan your OTC watchlist every "
+        "session* and let the candles tell you which pair is trending "
+        "right now.\n\n"
+        "📏 Easier-to-read pairs tend to have:\n"
+        "• Fewer sudden spikes/wicks\n"
+        "• Clear separation from the yellow line (not hugging it)\n"
+        "• A MACD line sloping steadily, not flattening/curling\n\n"
+        "🚨 *Honest note:* there's no fixed list of pairs guaranteed "
+        "to always trend. Any list claiming that goes stale fast — "
+        "the scanning habit is what keeps working, session after "
+        "session."
+    ),
+    (
+        "📖 *7. Quick Recap*\n\n"
+        "✅ *Do*\n"
+        "• Trade only when candles match in a row (trend)\n"
+        "• Check the yellow line for buy/sell mood\n"
+        "• Follow the color of the last closed candle\n"
+        "• Be careful and deliberate with martingale\n\n"
+        "❌ *Don't*\n"
+        "• Trade when colors are mixed (range)\n"
+        "• Ignore the yellow line and MACD\n"
+        "• Guess against the trend for no reason\n"
+        "• Martingale again and again with no plan\n\n"
+        "🧠 The real skill isn't the marker or MACD — it's correctly "
+        "telling a real trend apart from a range, in real time. That "
+        "takes practice.\n\n"
+        "🤝 Practice on a demo account first, trade small, and take "
+        "care of your money like a good friend takes care of you! ⭐"
+    ),
+]
+
+TRENDING_STRATEGY_DIAGRAMS = [
+    {
+        "file": f"{ASSETS_DIR}/diagram1_trend_vs_range.png",
+        "caption": "🛤️ Trending (left) vs. Ranging (right) — only trade the left one.",
+    },
+    {
+        "file": f"{ASSETS_DIR}/diagram2_yellow_line.png",
+        "caption": "📏 Above the yellow line = buy mood. Below it = sell mood.",
+    },
+    {
+        "file": f"{ASSETS_DIR}/diagram3_flow.png",
+        "caption": "🐾 The 7-step loop this strategy follows for every trade.",
+    },
+    {
+        "file": f"{ASSETS_DIR}/diagram4_scanning.png",
+        "caption": "🔍 Scan every pair each session, keep only the ones trending right now.",
+    },
+]
+
+# Registry of all strategies shown in the dropdown — add more here later
+STRATEGIES = {
+    "trending": {
+        "name": "📈 Trending Strategy",
+        "text": TRENDING_STRATEGY_TEXT,
+        "diagrams": TRENDING_STRATEGY_DIAGRAMS,
+    },
+    # "next_strategy_key": { "name": "...", "text": [...], "diagrams": [...] },
+}
+
+# ── Button builders ─────────────────────────────────────────────
+def main_menu_buttons():
+    return [
+        [Button.inline("📈 Strategy", b"menu:strategy")],
+        [Button.url("📂 Materials", GOOGLE_DRIVE_LINK)],
+        [Button.url("🔗 Register", POCKET_PARTNER_LINK)],
+    ]
+
+def strategy_list_buttons():
+    rows = []
+    for key, strat in STRATEGIES.items():
+        rows.append([Button.inline(strat["name"], f"strategy:{key}".encode())])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def diagram_nav_buttons(strategy_key, index, total):
+    row = []
+    if index > 0:
+        row.append(Button.inline("⬅️ Back", f"diagram:{strategy_key}:{index-1}".encode()))
+    if index < total - 1:
+        row.append(Button.inline("Next ➡️", f"diagram:{strategy_key}:{index+1}".encode()))
+    nav = [row] if row else []
+    nav.append([Button.inline("📚 All Strategies", b"menu:strategy")])
+    nav.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return nav
+
+# ── Registers /start, /menu commands and all button callbacks ──
+def setup_menu_handlers(bot):
+
+    @bot.on(events.NewMessage(pattern=r'^/(start|menu)$'))
+    async def start_handler(event):
+        await event.respond(
+            "👋 *Welcome to Rex Signal Bot!*\n\nChoose an option below:",
+            buttons=main_menu_buttons(),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"menu:main"))
+    async def main_menu_callback(event):
+        await event.edit(
+            "👋 *Welcome to Rex Signal Bot!*\n\nChoose an option below:",
+            buttons=main_menu_buttons(),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"menu:strategy"))
+    async def strategy_menu_callback(event):
+        await event.edit(
+            "📈 *Strategies*\n\nPick a strategy to view the full write-up:",
+            buttons=strategy_list_buttons(),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(pattern=rb"^strategy:(.+)$"))
+    async def strategy_detail_callback(event):
+        key = event.pattern_match.group(1).decode()
+        strat = STRATEGIES.get(key)
+        if not strat:
+            await event.answer("Strategy not found.", alert=True)
+            return
+
+        await event.answer(f"Loading {strat['name']}...")
+
+        chat = await event.get_chat()
+
+        for chunk in strat["text"]:
+            await bot.send_message(chat, chunk, parse_mode='markdown')
+
+        diagrams = strat["diagrams"]
+        if diagrams:
+            diagram_state[event.sender_id] = {"strategy": key, "index": 0}
+            first = diagrams[0]
+            await bot.send_file(
+                chat,
+                first["file"],
+                caption=first["caption"],
+                buttons=diagram_nav_buttons(key, 0, len(diagrams))
+            )
+        else:
+            await bot.send_message(
+                chat, "⬅️ Use the buttons below to go back.",
+                buttons=[[Button.inline("📚 All Strategies", b"menu:strategy")],
+                         [Button.inline("🏠 Main Menu", b"menu:main")]]
+            )
+
+    @bot.on(events.CallbackQuery(pattern=rb"^diagram:([^:]+):(\d+)$"))
+    async def diagram_nav_callback(event):
+        key = event.pattern_match.group(1).decode()
+        index = int(event.pattern_match.group(2))
+        strat = STRATEGIES.get(key)
+        if not strat:
+            await event.answer("Strategy not found.", alert=True)
+            return
+
+        diagrams = strat["diagrams"]
+        if index < 0 or index >= len(diagrams):
+            await event.answer()
+            return
+
+        diagram_state[event.sender_id] = {"strategy": key, "index": index}
+        item = diagrams[index]
+
+        try:
+            await event.edit(
+                file=item["file"],
+                text=item["caption"],
+                buttons=diagram_nav_buttons(key, index, len(diagrams))
+            )
+        except Exception as e:
+            logger.warning(f"Diagram edit failed, resending: {e}")
+            chat = await event.get_chat()
+            await bot.send_file(
+                chat,
+                item["file"],
+                caption=item["caption"],
+                buttons=diagram_nav_buttons(key, index, len(diagrams))
+            )
+
+        await event.answer()
+
+    logger.info("✅ Menu handlers registered (Strategy / Materials / Register)")
+
+# ══════════════════════════════════════════════════════════════
+# END NEW menu code
+# ══════════════════════════════════════════════════════════════
 
 # ── Keepalive ping every 4 minutes ─────────────────────────────
 async def keepalive(client):
@@ -331,6 +555,9 @@ async def run_bot():
         await userbot.disconnect()
         return False
 
+    # ── NEW: register the Strategy / Materials / Register menu ────
+    setup_menu_handlers(bot)
+
     logger.info("📥 Finding source group...")
     try:
         source_entity = await userbot.get_entity(SOURCE_GROUP)
@@ -355,7 +582,6 @@ async def run_bot():
         preview = text[:50].replace('\n', ' ')
         logger.info(f"📨 New message: {preview}...")
 
-        # ── Handle promotional messages ─────────────────────────
         if is_promo_message(text):
             try:
                 replacement = extract_signal_time_from_promo(text)
@@ -366,10 +592,8 @@ async def run_bot():
                 logger.error(f"❌ Promo replace error: {e}")
             return
 
-        # ── Always forward media messages with WIN/result captions
         if message.media and text:
             text_upper = text.upper()
-            # Force forward if caption contains WIN keywords
             force_forward = any(k in text_upper for k in [
                 'WIN ✅', '✅ WIN', 'WIN AT', 'INSTANT EXECUTION',
                 'WIN IN', 'DIRECT WIN', 'WIN AT M'
@@ -379,7 +603,6 @@ async def run_bot():
                 try:
                     direction = get_direction(text)
                     processed_caption = process_text(text, direction)
-                    # Use userbot to forward media (bot can't access source media)
                     sent = await userbot.send_file(
                         dest_entity,
                         file=message.media,
@@ -398,27 +621,21 @@ async def run_bot():
             return
 
         try:
-            # Detect direction
             direction = get_direction(text)
 
-            # Save direction for this message (for later result matching)
             if direction:
                 signal_direction_map[message.id] = direction
 
-            # If result message, get direction from original signal
             if message.reply_to_msg_id:
                 orig_dir = signal_direction_map.get(message.reply_to_msg_id)
                 if orig_dir and not direction:
                     direction = orig_dir
 
-            # Process text with emojis
             processed_text = process_text(text, direction)
 
             logger.info("🚨 Signal detected! Forwarding...")
 
-            # Send message
             if message.media:
-                # For media messages — use userbot to access source media
                 caption     = message.caption or ''
                 cap_dir = direction or get_direction(caption)
                 processed_caption = process_text(caption, cap_dir) if caption else ''
@@ -433,7 +650,6 @@ async def run_bot():
                     processed_text
                 )
 
-            # Save message ID mapping for edit sync
             message_map[message.id] = sent.id
             logger.info(f"✅ Forwarded: {message.id} → {sent.id}")
 
@@ -447,7 +663,6 @@ async def run_bot():
         text    = message.text or message.caption or ''
         logger.info(f"✏️ Message edited in source: {message.id}")
 
-        # Find corresponding dest message
         dest_msg_id = message_map.get(message.id)
         if not dest_msg_id:
             logger.info("⚠️ No mapping found — skipping edit")
@@ -457,24 +672,19 @@ async def run_bot():
             return
 
         try:
-            # Get direction
             direction = get_direction(text) or \
                         signal_direction_map.get(message.id)
 
-            # Check replied message direction
             if message.reply_to_msg_id:
                 orig_dir = signal_direction_map.get(message.reply_to_msg_id)
                 if orig_dir and not direction:
                     direction = orig_dir
 
-            # Update direction map
             if direction:
                 signal_direction_map[message.id] = direction
 
-            # Process text with emojis
             processed_text = process_text(text, direction)
 
-            # Edit destination message
             await bot.edit_message(
                 dest_entity,
                 dest_msg_id,
