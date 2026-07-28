@@ -676,7 +676,7 @@ except ImportError:
     GEMINI_AVAILABLE = False
 
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_MODEL   = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash-lite')
+GEMINI_MODEL   = os.environ.get('GEMINI_MODEL', 'gemini-3.1-flash-lite')
 
 class AgentLimitReached(Exception):
     """Raised when Gemini's free daily quota has been used up for the day."""
