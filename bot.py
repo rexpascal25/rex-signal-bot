@@ -226,22 +226,93 @@ def process_text(text, direction=None):
     return text
 
 # ══════════════════════════════════════════════════════════════
-# NEW: Strategy / Materials / Register menu
+# NEW: Strategy / Materials / Register / Signal Groups menu
 # ══════════════════════════════════════════════════════════════
 
+from telethon.tl.functions.messages import ExportChatInviteRequest
+
 # ── Links (set these as environment variables once you have them) ─
-GOOGLE_DRIVE_LINK   = os.environ.get('GOOGLE_DRIVE_LINK', 'https://example.com/replace-with-your-drive-link')
-POCKET_PARTNER_LINK = os.environ.get('POCKET_PARTNER_LINK', 'https://example.com/replace-with-your-pocket-partner-link')
+GOOGLE_DRIVE_LINK = os.environ.get('GOOGLE_DRIVE_LINK', 'https://example.com/replace-with-your-drive-link')
+
+# Comma-separated list of registration links, e.g.:
+#   REGISTER_LINKS=https://pocketoption.com/en/?ref=xxxx,https://quotex.com/?ref=yyyy
+# The bot auto-detects the platform name from each URL for the button label.
+REGISTER_LINKS_RAW = os.environ.get('REGISTER_LINKS', '')
+
+# Comma-separated list of signal group identifiers (usernames, invite
+# links, or numeric chat IDs), e.g.:
+#   SIGNAL_GROUPS=my_public_group,-1001234567890
+# The bot reads each group's real name automatically and links straight
+# to it — no manual naming needed.
+SIGNAL_GROUPS_RAW = os.environ.get('SIGNAL_GROUPS', '')
 
 # Tracks which diagram each user is currently viewing per strategy
 diagram_state = {}
 
-# ── Strategy write-ups + diagrams ──────────────────────────────
+# Cache of resolved signal groups: [{"name": ..., "url": ...}, ...]
+# Populated at startup by resolve_signal_groups(), refreshable via button.
+signal_groups_cache = []
+
+# ── Platform auto-detection for Register links ─────────────────
+PLATFORM_NAME_MAP = {
+    "pocketoption": "Pocket Option",
+    "iqoption":     "IQ Option",
+    "iqbroker":     "IQ Option",
+    "quotex":       "Quotex",
+    "binomo":       "Binomo",
+    "olymptrade":   "Olymp Trade",
+    "expertoption": "Expert Option",
+    "binance":      "Binance",
+    "bybit":        "Bybit",
+    "exness":       "Exness",
+    "deriv":        "Deriv",
+}
+
+def detect_platform_name(url):
+    """Guess a clean display name for a registration link based on its domain."""
+    url_lower = url.lower()
+    for key, name in PLATFORM_NAME_MAP.items():
+        if key in url_lower:
+            return name
+    # Fallback: use the domain's main part, title-cased
+    domain = re.sub(r'^https?://(www\.)?', '', url_lower).split('/')[0]
+    core = domain.split('.')[0] if domain else 'link'
+    return core.replace('-', ' ').replace('_', ' ').title() or "Register"
+
+def get_register_links():
+    urls = [u.strip() for u in REGISTER_LINKS_RAW.split(',') if u.strip()]
+    return [{"name": detect_platform_name(u), "url": u} for u in urls]
+
+# ── Signal group resolution ─────────────────────────────────────
+async def resolve_signal_groups(bot):
+    """Looks up each configured group/channel and builds a name+link list.
+    Uses the bot account (it must already be a member/admin of each group).
+    Public groups resolve to their t.me/username link; private groups get
+    a freshly exported invite link (requires the bot to have invite rights)."""
+    global signal_groups_cache
+    identifiers = [g.strip() for g in SIGNAL_GROUPS_RAW.split(',') if g.strip()]
+    resolved = []
+    for ident in identifiers:
+        try:
+            entity = await bot.get_entity(ident)
+            title = getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or ident
+            username = getattr(entity, 'username', None)
+            if username:
+                link = f"https://t.me/{username}"
+            else:
+                invite = await bot(ExportChatInviteRequest(entity))
+                link = invite.link
+            resolved.append({"name": title, "url": link})
+            logger.info(f"✅ Signal group resolved: {title} -> {link}")
+        except Exception as e:
+            logger.error(f"❌ Could not resolve signal group '{ident}': {e}")
+    signal_groups_cache = resolved
+    return resolved
+
+# ── Strategy write-ups + emoji diagrams ─────────────────────────
 # Add future strategies here — each needs a unique key, a display
 # name (shown in the dropdown button), the text chunks (each kept
-# under Telegram's 4096-char limit), and the diagram list.
-
-ASSETS_DIR = "assets"
+# under Telegram's 4096-char limit), and the emoji diagram list.
 
 TRENDING_STRATEGY_TEXT = [
     (
@@ -341,23 +412,36 @@ TRENDING_STRATEGY_TEXT = [
     ),
 ]
 
+# Emoji-only diagrams — no image files needed anymore
 TRENDING_STRATEGY_DIAGRAMS = [
-    {
-        "file": f"{ASSETS_DIR}/diagram1_trend_vs_range.png",
-        "caption": "🛤️ Trending (left) vs. Ranging (right) — only trade the left one.",
-    },
-    {
-        "file": f"{ASSETS_DIR}/diagram2_yellow_line.png",
-        "caption": "📏 Above the yellow line = buy mood. Below it = sell mood.",
-    },
-    {
-        "file": f"{ASSETS_DIR}/diagram3_flow.png",
-        "caption": "🐾 The 7-step loop this strategy follows for every trade.",
-    },
-    {
-        "file": f"{ASSETS_DIR}/diagram4_scanning.png",
-        "caption": "🔍 Scan every pair each session, keep only the ones trending right now.",
-    },
+    (
+        "🛤️ *Trending vs. Ranging*\n\n"
+        "🟢🟢🟢🟢🟢 → *TRENDING* (all matching, safe to trade!)\n\n"
+        "🟢🔴🟢🔴🟢 → *RANGING* (mixed colors, skip it!)"
+    ),
+    (
+        "📏 *The Yellow Line Mood*\n\n"
+        "⬆️📈 Above the yellow line → 🟢 *BUY* mood\n\n"
+        "⬇️📉 Below the yellow line → 🔴 *SELL* mood"
+    ),
+    (
+        "🐾 *The 7-Step Loop*\n\n"
+        "1️⃣ Look at candles\n"
+        "2️⃣➡️ Trending?\n"
+        "3️⃣➡️ Check yellow line\n"
+        "4️⃣➡️ Wait for candle to close\n"
+        "5️⃣➡️ Enter new candle, same direction\n"
+        "6️⃣➡️ Win? repeat 🔁 Lose? martingale once 🎲\n"
+        "7️⃣ Mixed colors? 🛑 STOP, find another pair"
+    ),
+    (
+        "🔍 *Daily Pair Scan*\n\n"
+        "🔎 EUR/USD OTC → trending? ❓\n"
+        "🔎 GBP/JPY OTC → trending? ❓\n"
+        "🔎 AUD/CAD OTC → trending? ❓\n\n"
+        "✅ Found one trending → trade it! 🎯\n"
+        "❌ All ranging → wait and rescan 🔁"
+    ),
 ]
 
 # Registry of all strategies shown in the dropdown — add more here later
@@ -375,7 +459,8 @@ def main_menu_buttons():
     return [
         [Button.inline("📈 Strategy", b"menu:strategy")],
         [Button.url("📂 Materials", GOOGLE_DRIVE_LINK)],
-        [Button.url("🔗 Register", POCKET_PARTNER_LINK)],
+        [Button.inline("🔗 Register", b"menu:register")],
+        [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
     ]
 
 def strategy_list_buttons():
@@ -395,6 +480,18 @@ def diagram_nav_buttons(strategy_key, index, total):
     nav.append([Button.inline("📚 All Strategies", b"menu:strategy")])
     nav.append([Button.inline("🏠 Main Menu", b"menu:main")])
     return nav
+
+def register_list_buttons():
+    links = get_register_links()
+    rows = [[Button.url(l["name"], l["url"])] for l in links]
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def signal_groups_buttons():
+    rows = [[Button.url(g["name"], g["url"])] for g in signal_groups_cache]
+    rows.append([Button.inline("🔄 Refresh", b"signal_groups:refresh")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
 
 # ── Registers /start, /menu commands and all button callbacks ──
 def setup_menu_handlers(bot):
@@ -441,11 +538,10 @@ def setup_menu_handlers(bot):
         diagrams = strat["diagrams"]
         if diagrams:
             diagram_state[event.sender_id] = {"strategy": key, "index": 0}
-            first = diagrams[0]
-            await bot.send_file(
+            await bot.send_message(
                 chat,
-                first["file"],
-                caption=first["caption"],
+                diagrams[0],
+                parse_mode='markdown',
                 buttons=diagram_nav_buttons(key, 0, len(diagrams))
             )
         else:
@@ -470,27 +566,65 @@ def setup_menu_handlers(bot):
             return
 
         diagram_state[event.sender_id] = {"strategy": key, "index": index}
-        item = diagrams[index]
 
-        try:
-            await event.edit(
-                file=item["file"],
-                text=item["caption"],
-                buttons=diagram_nav_buttons(key, index, len(diagrams))
-            )
-        except Exception as e:
-            logger.warning(f"Diagram edit failed, resending: {e}")
-            chat = await event.get_chat()
-            await bot.send_file(
-                chat,
-                item["file"],
-                caption=item["caption"],
-                buttons=diagram_nav_buttons(key, index, len(diagrams))
-            )
-
+        await event.edit(
+            diagrams[index],
+            parse_mode='markdown',
+            buttons=diagram_nav_buttons(key, index, len(diagrams))
+        )
         await event.answer()
 
-    logger.info("✅ Menu handlers registered (Strategy / Materials / Register)")
+    @bot.on(events.CallbackQuery(data=b"menu:register"))
+    async def register_callback(event):
+        links = get_register_links()
+        if not links:
+            await event.edit(
+                "🔗 *Register*\n\nNo registration links added yet — check back soon!",
+                buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]],
+                parse_mode='markdown'
+            )
+            return
+        await event.edit(
+            "🔗 *Register*\n\nChoose a platform to register:",
+            buttons=register_list_buttons(),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"menu:signal_groups"))
+    async def signal_groups_callback(event):
+        if not signal_groups_cache:
+            await event.edit(
+                "📡 *Signal Groups*\n\nNo signal groups added yet — check back soon!",
+                buttons=[[Button.inline("🔄 Refresh", b"signal_groups:refresh")],
+                         [Button.inline("🏠 Main Menu", b"menu:main")]],
+                parse_mode='markdown'
+            )
+            return
+        await event.edit(
+            "📡 *Signal Groups*\n\nTap a group to join:",
+            buttons=signal_groups_buttons(),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"signal_groups:refresh"))
+    async def signal_groups_refresh_callback(event):
+        await event.answer("Refreshing groups...")
+        await resolve_signal_groups(bot)
+        if not signal_groups_cache:
+            await event.edit(
+                "📡 *Signal Groups*\n\nNo signal groups added yet — check back soon!",
+                buttons=[[Button.inline("🔄 Refresh", b"signal_groups:refresh")],
+                         [Button.inline("🏠 Main Menu", b"menu:main")]],
+                parse_mode='markdown'
+            )
+            return
+        await event.edit(
+            "📡 *Signal Groups*\n\nTap a group to join:",
+            buttons=signal_groups_buttons(),
+            parse_mode='markdown'
+        )
+
+    logger.info("✅ Menu handlers registered (Strategy / Materials / Register / Signal Groups)")
 
 # ══════════════════════════════════════════════════════════════
 # END NEW menu code
@@ -555,8 +689,9 @@ async def run_bot():
         await userbot.disconnect()
         return False
 
-    # ── NEW: register the Strategy / Materials / Register menu ────
+    # ── NEW: register the Strategy / Materials / Register / Signal Groups menu ────
     setup_menu_handlers(bot)
+    await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
     try:
