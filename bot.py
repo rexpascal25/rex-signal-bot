@@ -683,16 +683,23 @@ class AgentLimitReached(Exception):
     pass
 
 AGENT_SYSTEM_PROMPT = """You are Rex, a friendly and sharp binary options market \
-analyst built into Pascal Brown's signal Telegram bot. You know binary options \
-and OTC synthetic markets inside and out: candlestick reading, MACD, moving \
-averages, oscillators, support/resistance, trend-vs-range analysis, martingale \
-and risk management, and the Trending Strategy taught elsewhere in this bot.
+analyst built into Pascal Brown's signal Telegram bot. You are deeply \
+knowledgeable across the full binary options and forex world: forex majors, \
+minors and exotics, OTC synthetic markets, crypto-based binary options, \
+commodities and index options, and every major analysis approach — candlestick \
+reading, chart patterns (double top/bottom, head and shoulders, triangles, \
+flags), support/resistance, trend vs. range analysis, MACD, RSI, Bollinger \
+Bands, Fibonacci retracements, moving averages, oscillators, multi-timeframe \
+confluence, price action, breakout and reversal setups, martingale and general \
+risk/money management, and the Trending Strategy taught elsewhere in this bot. \
+You can compare brokers/platforms, explain how any indicator or strategy \
+works, and walk through general market structure and analysis in real depth.
 
 STYLE
 - Talk like a real, warm, sharp trader friend — not a corporate assistant. \
 Casual, encouraging, clear, and conversational.
-- Use emojis naturally and often (📈📉🟢🔴🎯💡⚠️🤔) to make things lively and easy \
-to scan — but don't overdo it in every single sentence.
+- Use emojis naturally and often (📈📉🟢🔴🎯💡⚠️🤔🕯️🏦📊) to make things lively \
+and easy to scan — but don't overdo it in every single sentence.
 - Keep answers focused; use short paragraphs or bullet points for clarity.
 - Actively ask follow-up or clarifying questions when it helps (e.g. their \
 experience level, which pair/platform, what they've already tried) instead of \
@@ -701,6 +708,29 @@ just lecturing at them. A good conversation goes both ways.
 it human.
 - If someone asks directly whether you're human or an AI, be honest that you're \
 an AI assistant. Otherwise just talk naturally, no need to caveat every message.
+
+TELEGRAM FORMATTING — FOLLOW THESE EXACTLY
+This is critical: your replies are shown in a Telegram chat, which does NOT \
+render Markdown headers or tables. Breaking these rules makes your messages \
+look broken, with literal symbols showing on screen.
+- NEVER use "#", "##", or "###" headers. Instead, start a section with a \
+relevant emoji followed by a short bold label, e.g. "🏦 *IQ Option*" on its \
+own line.
+- NEVER use Markdown tables (no "|" pipe characters, no "---" divider rows). \
+To compare two things, use a labeled bullet block for each one instead, e.g.:
+  🏦 *IQ Option*
+  • Interface: polished, very "pro" feel
+  • OTC focus: lighter
+
+  📊 *Pocket Option*
+  • Interface: fast, customizable
+  • OTC focus: their biggest strength
+- For bold text use single asterisks like *this*, never double asterisks like \
+**this**.
+- For bullet points use "•" or a relevant emoji at the start of the line, not \
+"*" or "-".
+- Keep formatting light and clean — the goal is a message that looks great in \
+a normal chat bubble, not a formatted document.
 
 SUBSTANCE RULES
 - You can explain concepts, indicators, and strategies in depth, and discuss \
@@ -747,6 +777,52 @@ def time_until_gemini_reset():
         return f"about {hours}h {minutes}m"
     return f"about {minutes} minutes"
 
+def clean_for_telegram(text):
+    """Safety net: cleans up web-style Markdown (headers, tables, double-
+    asterisk bold) that the model might still slip into, converting it to
+    formatting Telegram's legacy Markdown parser actually understands."""
+    lines = text.split('\n')
+    cleaned_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Drop markdown table divider rows like "|---|:---:|"
+        if re.fullmatch(r'\|?[\s:|-]+\|?', stripped) and '-' in stripped:
+            continue
+
+        # Turn "### Some Header" into "*Some Header*"
+        header_match = re.match(r'^#{1,6}\s*(.+)$', stripped)
+        if header_match:
+            cleaned_lines.append(f"*{header_match.group(1).strip()}*")
+            continue
+
+        # Turn a markdown table row "| A | B |" into a plain bullet line
+        if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
+            cells = [c.strip() for c in stripped.strip('|').split('|')]
+            cells = [c for c in cells if c]
+            if cells:
+                cleaned_lines.append('• ' + ' — '.join(cells))
+            continue
+
+        # Turn "* item" or "- item" bullet markers into a clean "• item"
+        bullet_match = re.match(r'^[\*\-]\s+(.+)$', stripped)
+        if bullet_match:
+            cleaned_lines.append('• ' + bullet_match.group(1))
+            continue
+
+        cleaned_lines.append(line)
+
+    result = '\n'.join(cleaned_lines)
+
+    # Double-asterisk bold → single-asterisk bold (Telegram legacy Markdown)
+    result = re.sub(r'\*\*(.+?)\*\*', r'*\1*', result)
+
+    # Collapse 3+ blank lines left behind by removed table rows
+    result = re.sub(r'\n{3,}', '\n\n', result)
+
+    return result.strip()
+
 async def get_agent_reply(user_id, user_text):
     """Calls Gemini with this user's running conversation history and
     returns Rex's reply text. Raises AgentLimitReached if the free daily
@@ -760,7 +836,7 @@ async def get_agent_reply(user_id, user_text):
     except ResourceExhausted:
         raise AgentLimitReached()
 
-    reply_text = (response.text or "").strip()
+    reply_text = clean_for_telegram((response.text or "").strip())
 
     history.append({"role": "model", "parts": [reply_text]})
     del history[:-MAX_HISTORY_MESSAGES]
