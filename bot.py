@@ -461,6 +461,7 @@ def main_menu_buttons():
         [Button.url("📂 Materials", GOOGLE_DRIVE_LINK)],
         [Button.inline("🔗 Register", b"menu:register")],
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
+        [Button.inline("🤖 Market Analyst", b"menu:analyst")],
     ]
 
 def strategy_list_buttons():
@@ -624,7 +625,143 @@ def setup_menu_handlers(bot):
             parse_mode='markdown'
         )
 
-    logger.info("✅ Menu handlers registered (Strategy / Materials / Register / Signal Groups)")
+    # ── Market Analyst (AI agent) callbacks ─────────────────────
+    @bot.on(events.CallbackQuery(data=b"menu:analyst"))
+    async def analyst_intro_callback(event):
+        await event.edit(
+            "🤖 *Market Analyst*\n\n"
+            "Hey, I'm Rex! 👋 Ask me anything about binary options trading — "
+            "candlesticks, indicators, strategies, risk management, whatever's "
+            "on your mind. Just type your question below and I'll reply right "
+            "here in this chat. 📊💬\n\n"
+            "_(Tap 🔄 New Chat anytime to clear our conversation and start fresh.)_",
+            buttons=[[Button.inline("🔄 New Chat", b"analyst:reset")],
+                     [Button.inline("🏠 Main Menu", b"menu:main")]],
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"analyst:reset"))
+    async def analyst_reset_callback(event):
+        agent_conversations.pop(event.sender_id, None)
+        await event.answer("🔄 Chat cleared! Ask me anything.")
+
+    logger.info("✅ Menu handlers registered (Strategy / Materials / Register / Signal Groups / Analyst)")
+
+# ══════════════════════════════════════════════════════════════
+# NEW: AI Market Analyst agent (powered by the Anthropic API)
+# ══════════════════════════════════════════════════════════════
+#
+# Setup:
+#   1. pip install anthropic
+#   2. Set env var ANTHROPIC_API_KEY to your own Anthropic API key
+#      (this is separate from your Telegram bot token — get one at
+#      https://console.anthropic.com)
+#   3. Optionally set AGENT_MODEL to override the default model.
+
+from anthropic import AsyncAnthropic
+
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+AGENT_MODEL       = os.environ.get('AGENT_MODEL', 'claude-sonnet-5')
+
+anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+# Per-user conversation memory: {user_id: [{"role": "user"/"assistant", "content": "..."}]}
+agent_conversations = {}
+MAX_HISTORY_MESSAGES = 16  # keep the last 8 exchanges per user (trims cost/context)
+
+AGENT_SYSTEM_PROMPT = """You are Rex, a friendly and sharp binary options market \
+analyst built into Pascal Brown's signal Telegram bot. You know binary options \
+and OTC synthetic markets inside and out: candlestick reading, MACD, moving \
+averages, oscillators, support/resistance, trend-vs-range analysis, martingale \
+and risk management, and the Trending Strategy taught elsewhere in this bot.
+
+STYLE
+- Talk like a real, warm, sharp trader friend — not a corporate assistant. \
+Casual, encouraging, clear, and conversational.
+- Use emojis naturally and often (📈📉🟢🔴🎯💡⚠️🤔) to make things lively and easy \
+to scan — but don't overdo it in every single sentence.
+- Keep answers focused; use short paragraphs or bullet points for clarity.
+- Actively ask follow-up or clarifying questions when it helps (e.g. their \
+experience level, which pair/platform, what they've already tried) instead of \
+just lecturing at them. A good conversation goes both ways.
+- React to what the user shares — empathize with losses, celebrate wins, keep \
+it human.
+- If someone asks directly whether you're human or an AI, be honest that you're \
+an AI assistant. Otherwise just talk naturally, no need to caveat every message.
+
+SUBSTANCE RULES
+- You can explain concepts, indicators, and strategies in depth, and discuss \
+general market structure and risk management.
+- Never promise or imply a guaranteed win, a "sure" signal, or certainty about \
+future price direction. Markets are probabilistic — frame things as tendencies \
+and probabilities, not certainties.
+- Don't hand someone a specific "buy/sell right now, this amount" call as if it \
+were financial advice to act on with real money. Instead help them learn to \
+read the chart and decide for themselves.
+- Be honest about risk when it's relevant: binary options and OTC synthetic \
+markets are high-risk, and martingale can wipe out an account fast across a \
+losing streak. Mention this naturally when it fits, without being preachy \
+about it in every reply.
+- If someone seems to be chasing losses, spiraling, or deciding out of \
+desperation rather than analysis, gently flag that and encourage them to step \
+back rather than helping them size up a bigger bet.
+"""
+
+async def get_agent_reply(user_id, user_text):
+    """Calls the Anthropic API with this user's running conversation history
+    and returns Rex's reply text."""
+    history = agent_conversations.setdefault(user_id, [])
+    history.append({"role": "user", "content": user_text})
+    del history[:-MAX_HISTORY_MESSAGES]  # keep only the most recent messages
+
+    response = await anthropic_client.messages.create(
+        model=AGENT_MODEL,
+        max_tokens=700,
+        system=AGENT_SYSTEM_PROMPT,
+        messages=history,
+    )
+    reply_text = "".join(
+        block.text for block in response.content if block.type == "text"
+    ).strip()
+
+    history.append({"role": "assistant", "content": reply_text})
+    del history[:-MAX_HISTORY_MESSAGES]
+
+    return reply_text
+
+def setup_agent_handler(bot):
+    """Registers the free-text handler that powers Rex's DM conversations.
+    Only fires on incoming private messages that aren't commands, so it never
+    interferes with /start, /menu, button callbacks, or group forwarding."""
+
+    @bot.on(events.NewMessage(
+        incoming=True,
+        func=lambda e: e.is_private and bool(e.raw_text) and not e.raw_text.startswith('/')
+    ))
+    async def agent_message_handler(event):
+        if not anthropic_client:
+            await event.respond(
+                "🤖 The Market Analyst isn't set up yet — the bot owner needs to "
+                "add an ANTHROPIC_API_KEY. 🔧"
+            )
+            return
+
+        try:
+            async with bot.action(event.chat_id, 'typing'):
+                reply_text = await get_agent_reply(event.sender_id, event.raw_text)
+        except Exception as e:
+            logger.error(f"❌ Analyst agent error: {e}")
+            await event.respond(
+                "⚠️ Sorry, I couldn't reach the market analyst brain right now — "
+                "try again in a moment. 🔄"
+            )
+            return
+
+        # Telegram message length safety (4096 char limit)
+        for i in range(0, len(reply_text), 3900):
+            await event.respond(reply_text[i:i + 3900])
+
+    logger.info("✅ Market Analyst agent handler registered")
 
 # ══════════════════════════════════════════════════════════════
 # END NEW menu code
@@ -691,6 +828,7 @@ async def run_bot():
 
     # ── NEW: register the Strategy / Materials / Register / Signal Groups menu ────
     setup_menu_handlers(bot)
+    setup_agent_handler(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
