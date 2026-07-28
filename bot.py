@@ -461,7 +461,8 @@ def main_menu_buttons():
         [Button.url("📂 Materials", GOOGLE_DRIVE_LINK)],
         [Button.inline("🔗 Register", b"menu:register")],
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
-        [Button.inline("🤖 Market Analyst", b"menu:analyst")],
+        # ── Market Analyst button — PAUSED for now, uncomment to re-enable ──
+        # [Button.inline("🤖 Market Analyst", b"menu:analyst")],
     ]
 
 def strategy_list_buttons():
@@ -658,12 +659,16 @@ def setup_menu_handlers(bot):
 #      https://console.anthropic.com)
 #   3. Optionally set AGENT_MODEL to override the default model.
 
-from anthropic import AsyncAnthropic
+try:
+    from anthropic import AsyncAnthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 AGENT_MODEL       = os.environ.get('AGENT_MODEL', 'claude-sonnet-5')
 
-anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY) else None
 
 # Per-user conversation memory: {user_id: [{"role": "user"/"assistant", "content": "..."}]}
 agent_conversations = {}
@@ -828,7 +833,10 @@ async def run_bot():
 
     # ── NEW: register the Strategy / Materials / Register / Signal Groups menu ────
     setup_menu_handlers(bot)
-    setup_agent_handler(bot)
+    # ── Market Analyst agent — PAUSED for now. Uncomment the line below
+    # once you're ready to enable it (after `pip install anthropic` and
+    # setting ANTHROPIC_API_KEY): ─────────────────────────────────────
+    # setup_agent_handler(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
