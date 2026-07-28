@@ -1,5 +1,4 @@
 telethon
-telethon
 google-generativeai
 cryptg
 flask
