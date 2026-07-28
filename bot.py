@@ -461,8 +461,7 @@ def main_menu_buttons():
         [Button.url("📂 Materials", GOOGLE_DRIVE_LINK)],
         [Button.inline("🔗 Register", b"menu:register")],
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
-        # ── Market Analyst button — PAUSED for now, uncomment to re-enable ──
-        # [Button.inline("🤖 Market Analyst", b"menu:analyst")],
+        [Button.inline("🤖 Market Analyst", b"menu:analyst")],
     ]
 
 def strategy_list_buttons():
@@ -649,30 +648,39 @@ def setup_menu_handlers(bot):
     logger.info("✅ Menu handlers registered (Strategy / Materials / Register / Signal Groups / Analyst)")
 
 # ══════════════════════════════════════════════════════════════
-# NEW: AI Market Analyst agent (powered by the Anthropic API)
+# NEW: AI Market Analyst agent (powered by Google Gemini's free API)
 # ══════════════════════════════════════════════════════════════
 #
 # Setup:
-#   1. pip install anthropic
-#   2. Set env var ANTHROPIC_API_KEY to your own Anthropic API key
-#      (this is separate from your Telegram bot token — get one at
-#      https://console.anthropic.com)
-#   3. Optionally set AGENT_MODEL to override the default model.
+#   1. pip install google-generativeai
+#   2. Get a free API key (no credit card needed) at
+#      https://aistudio.google.com/apikey
+#   3. Set env var GEMINI_API_KEY to that key.
+#   4. Optionally set GEMINI_MODEL to override the default model.
+#
+# Gemini's free tier has a daily request limit that resets at
+# midnight Pacific Time. When it's hit, the bot tells the user
+# exactly how long until it resets instead of erroring out.
+
+import datetime
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 try:
-    from anthropic import AsyncAnthropic
-    ANTHROPIC_AVAILABLE = True
+    import google.generativeai as genai
+    from google.api_core.exceptions import ResourceExhausted
+    GEMINI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
+    GEMINI_AVAILABLE = False
 
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-AGENT_MODEL       = os.environ.get('AGENT_MODEL', 'claude-sonnet-5')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_MODEL   = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 
-anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY) else None
-
-# Per-user conversation memory: {user_id: [{"role": "user"/"assistant", "content": "..."}]}
-agent_conversations = {}
-MAX_HISTORY_MESSAGES = 16  # keep the last 8 exchanges per user (trims cost/context)
+class AgentLimitReached(Exception):
+    """Raised when Gemini's free daily quota has been used up for the day."""
+    pass
 
 AGENT_SYSTEM_PROMPT = """You are Rex, a friendly and sharp binary options market \
 analyst built into Pascal Brown's signal Telegram bot. You know binary options \
@@ -712,24 +720,49 @@ desperation rather than analysis, gently flag that and encourage them to step \
 back rather than helping them size up a bigger bet.
 """
 
+gemini_model = None
+if GEMINI_AVAILABLE and GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=AGENT_SYSTEM_PROMPT
+    )
+
+# Per-user conversation memory: {user_id: [{"role": "user"/"model", "parts": [...]}, ...]}
+agent_conversations = {}
+MAX_HISTORY_MESSAGES = 16  # keep the last 8 exchanges per user (trims cost/context)
+
+def time_until_gemini_reset():
+    """Returns a human-readable countdown to Gemini's next midnight-Pacific reset."""
+    if ZoneInfo is None:
+        return "later today"
+    pacific_now = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
+    next_reset = (pacific_now + datetime.timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    remaining = next_reset - pacific_now
+    total_minutes = int(remaining.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours > 0:
+        return f"about {hours}h {minutes}m"
+    return f"about {minutes} minutes"
+
 async def get_agent_reply(user_id, user_text):
-    """Calls the Anthropic API with this user's running conversation history
-    and returns Rex's reply text."""
+    """Calls Gemini with this user's running conversation history and
+    returns Rex's reply text. Raises AgentLimitReached if the free daily
+    quota has been used up."""
     history = agent_conversations.setdefault(user_id, [])
-    history.append({"role": "user", "content": user_text})
+    history.append({"role": "user", "parts": [user_text]})
     del history[:-MAX_HISTORY_MESSAGES]  # keep only the most recent messages
 
-    response = await anthropic_client.messages.create(
-        model=AGENT_MODEL,
-        max_tokens=700,
-        system=AGENT_SYSTEM_PROMPT,
-        messages=history,
-    )
-    reply_text = "".join(
-        block.text for block in response.content if block.type == "text"
-    ).strip()
+    try:
+        response = await gemini_model.generate_content_async(history)
+    except ResourceExhausted:
+        raise AgentLimitReached()
 
-    history.append({"role": "assistant", "content": reply_text})
+    reply_text = (response.text or "").strip()
+
+    history.append({"role": "model", "parts": [reply_text]})
     del history[:-MAX_HISTORY_MESSAGES]
 
     return reply_text
@@ -744,16 +777,25 @@ def setup_agent_handler(bot):
         func=lambda e: e.is_private and bool(e.raw_text) and not e.raw_text.startswith('/')
     ))
     async def agent_message_handler(event):
-        if not anthropic_client:
+        if not gemini_model:
             await event.respond(
                 "🤖 The Market Analyst isn't set up yet — the bot owner needs to "
-                "add an ANTHROPIC_API_KEY. 🔧"
+                "add a GEMINI_API_KEY. 🔧"
             )
             return
 
         try:
             async with bot.action(event.chat_id, 'typing'):
                 reply_text = await get_agent_reply(event.sender_id, event.raw_text)
+        except AgentLimitReached:
+            wait_str = time_until_gemini_reset()
+            await event.respond(
+                "🤖 I've hit my free daily question limit for today! 😅\n\n"
+                f"It resets at midnight Pacific Time — that's *{wait_str}* from "
+                "now. Come back after that and I'll be ready to chat again! 🔄📊",
+                parse_mode='markdown'
+            )
+            return
         except Exception as e:
             logger.error(f"❌ Analyst agent error: {e}")
             await event.respond(
@@ -833,10 +875,8 @@ async def run_bot():
 
     # ── NEW: register the Strategy / Materials / Register / Signal Groups menu ────
     setup_menu_handlers(bot)
-    # ── Market Analyst agent — PAUSED for now. Uncomment the line below
-    # once you're ready to enable it (after `pip install anthropic` and
-    # setting ANTHROPIC_API_KEY): ─────────────────────────────────────
-    # setup_agent_handler(bot)
+    # ── Market Analyst agent — now powered by Gemini's free tier ────
+    setup_agent_handler(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
