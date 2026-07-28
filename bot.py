@@ -244,7 +244,10 @@ REGISTER_LINKS_RAW = os.environ.get('REGISTER_LINKS', '')
 #   SIGNAL_GROUPS=my_public_group,-1001234567890
 # The bot reads each group's real name automatically and links straight
 # to it — no manual naming needed.
-SIGNAL_GROUPS_RAW = os.environ.get('SIGNAL_GROUPS', '')
+# If SIGNAL_GROUPS isn't set at all, it automatically falls back to
+# DEST_GROUP — handy when your signal group and your destination group
+# for forwarded signals are the same group (no need to set both).
+SIGNAL_GROUPS_RAW = os.environ.get('SIGNAL_GROUPS', '') or DEST_GROUP
 
 # Tracks which diagram each user is currently viewing per strategy
 diagram_state = {}
@@ -286,26 +289,69 @@ def get_register_links():
 # ── Signal group resolution ─────────────────────────────────────
 async def resolve_signal_groups(bot):
     """Looks up each configured group/channel and builds a name+link list.
-    Uses the bot account (it must already be a member/admin of each group).
-    Public groups resolve to their t.me/username link; private groups get
-    a freshly exported invite link (requires the bot to have invite rights)."""
+
+    Each entry in SIGNAL_GROUPS can be:
+      • a bare username or numeric chat ID, e.g. "my_public_group" or "-100123..."
+        (the bot must be an admin there) — the bot generates a FRESH invite
+        link that requires YOUR approval before anyone can join, even with
+        the link in hand. This is the recommended option for a private,
+        access-controlled group.
+      • a full invite link, e.g. "https://t.me/+xpJoAOt0B2c4N2I0" — used
+        as-is (whatever join behavior that link already has can't be changed
+        here), with the bot only trying to fetch the real group name for
+        the button.
+      • an optional custom label using "::" , e.g.
+        "Rex Signals VIP::https://t.me/+xpJoAOt0B2c4N2I0" to force the button
+        text instead of relying on auto-detection
+    """
     global signal_groups_cache
-    identifiers = [g.strip() for g in SIGNAL_GROUPS_RAW.split(',') if g.strip()]
+    raw_items = [g.strip() for g in SIGNAL_GROUPS_RAW.split(',') if g.strip()]
     resolved = []
-    for ident in identifiers:
+
+    for idx, raw_item in enumerate(raw_items, start=1):
+        custom_name = None
+        ident = raw_item
+        if '::' in raw_item:
+            custom_name, ident = (part.strip() for part in raw_item.split('::', 1))
+
+        is_link = ident.startswith('http://') or ident.startswith('https://') or ident.startswith('t.me/')
+
+        if is_link:
+            link = ident if ident.startswith('http') else f"https://{ident}"
+            title = custom_name or f"Signal Group {idx}"
+            try:
+                entity = await bot.get_entity(ident)
+                title = custom_name or getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or title
+            except Exception as e:
+                logger.warning(f"⚠️ Could not auto-fetch a name for '{ident}', using '{title}': {e}")
+            resolved.append({"name": title, "url": link})
+            logger.info(f"✅ Signal group added: {title} -> {link}")
+            continue
+
+        # Otherwise treat it as a username or numeric chat ID.
+        # Telegram chat IDs must be passed as actual integers, not text,
+        # or entity lookup fails — so convert numeric-looking strings here.
+        lookup_ident = ident
+        if re.fullmatch(r'-?\d+', ident):
+            lookup_ident = int(ident)
+
         try:
-            entity = await bot.get_entity(ident)
-            title = getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or ident
+            entity = await bot.get_entity(lookup_ident)
+            title = custom_name or getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or ident
             username = getattr(entity, 'username', None)
             if username:
                 link = f"https://t.me/{username}"
             else:
-                invite = await bot(ExportChatInviteRequest(entity))
+                # request_needed=True means the link lets people REQUEST to
+                # join, but nobody gets in until you (the admin) approve
+                # them in Telegram — even if they have the link.
+                invite = await bot(ExportChatInviteRequest(entity, request_needed=True))
                 link = invite.link
             resolved.append({"name": title, "url": link})
             logger.info(f"✅ Signal group resolved: {title} -> {link}")
         except Exception as e:
             logger.error(f"❌ Could not resolve signal group '{ident}': {e}")
+
     signal_groups_cache = resolved
     return resolved
 
