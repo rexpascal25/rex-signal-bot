@@ -1017,6 +1017,16 @@ async def run_bot():
         logger.error(f"❌ Destination error: {e}")
         return False
 
+    # userbot needs its OWN resolved copy of the destination entity — an
+    # entity object carries an access_hash that's specific to whichever
+    # account discovered it, so reusing bot's dest_entity inside a userbot
+    # request (like send_file) fails with "Invalid channel object."
+    try:
+        userbot_dest_entity = await userbot.get_entity(int(DEST_GROUP))
+    except Exception as e:
+        logger.error(f"❌ userbot could not resolve destination group: {e}")
+        return False
+
     # ── NEW MESSAGE Handler ────────────────────────────────────
     @userbot.on(events.NewMessage(chats=source_entity))
     async def handler(event):
@@ -1047,7 +1057,7 @@ async def run_bot():
                     direction = get_direction(text)
                     processed_caption = process_text(text, direction)
                     sent = await userbot.send_file(
-                        dest_entity,
+                        userbot_dest_entity,
                         file=message.media,
                         caption=processed_caption
                     )
@@ -1083,7 +1093,7 @@ async def run_bot():
                 cap_dir = direction or get_direction(caption)
                 processed_caption = process_text(caption, cap_dir) if caption else ''
                 sent = await userbot.send_file(
-                    dest_entity,
+                    userbot_dest_entity,
                     file=message.media,
                     caption=processed_caption or processed_text
                 )
