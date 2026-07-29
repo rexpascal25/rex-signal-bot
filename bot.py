@@ -504,7 +504,7 @@ STRATEGIES = {
 def main_menu_buttons():
     return [
         [Button.inline("📈 Strategy", b"menu:strategy")],
-        [Button.url("📂 Materials", GOOGLE_DRIVE_LINK)],
+        [Button.inline("📂 Materials", b"menu:materials")],
         [Button.inline("🔗 Register", b"menu:register")],
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
         [Button.inline("🤖 Market Analyst", b"menu:analyst")],
@@ -620,6 +620,18 @@ def setup_menu_handlers(bot):
             buttons=diagram_nav_buttons(key, index, len(diagrams))
         )
         await event.answer()
+
+    @bot.on(events.CallbackQuery(data=b"menu:materials"))
+    async def materials_callback(event):
+        await event.answer()
+        chat = await event.get_chat()
+        await bot.send_message(
+            chat,
+            f"📂 *Materials*\n\nHere's the folder: {GOOGLE_DRIVE_LINK}",
+            buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]],
+            parse_mode='markdown',
+            link_preview=False
+        )
 
     @bot.on(events.CallbackQuery(data=b"menu:register"))
     async def register_callback(event):
