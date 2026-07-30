@@ -7,6 +7,7 @@ from telethon.sessions import StringSession
 import asyncio
 import re
 import os
+import json
 import logging
 
 # ── Logging setup ──────────────────────────────────────────────
@@ -508,7 +509,7 @@ def main_menu_buttons():
         [Button.inline("🔗 Register", b"menu:register")],
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
         [Button.inline("🤖 Market Analyst", b"menu:analyst")],
-        [Button.inline("📊 Trade", b"menu:trade")],
+        [Button.inline("🟡 Trade on Binance", b"menu:trade")],
     ]
 
 def strategy_list_buttons():
@@ -878,14 +879,25 @@ def clean_for_telegram(text):
 #   1. pip install python-binance
 #   2. Create API keys at https://www.binance.com/en/my/settings/api-management
 #      (or https://testnet.binance.vision for a safe fake-money testnet account)
-#   3. Set env vars BINANCE_API_KEY and BINANCE_API_SECRET
-#   4. BINANCE_TESTNET defaults to "true" — trades use fake testnet money
-#      until you deliberately set it to "false". Test thoroughly first.
+#   3. Set env var BINANCE_TESTNET (defaults to "true" — fake money until
+#      you deliberately set it to "false")
+#   4. Set BINANCE_ENCRYPTION_KEY — a secret key used to encrypt each
+#      user's own API credentials before storing them. Generate one with:
+#        python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#      Treat this like a master password — if it leaks, stored user keys
+#      could be decrypted; if you lose it, stored keys become unusable and
+#      everyone has to reconnect via /connectbinance.
+#   5. pip install python-binance cryptography
 #
-# SAFETY DESIGN: Rex (the AI) can only ever DISCUSS the market using real
-# live data. It cannot place trades. Trade execution only happens through
-# the explicit /trade command below, and ONLY after the user taps a
-# Confirm button — there is no code path where a trade fires automatically.
+# SAFETY + PRIVACY DESIGN:
+#   • Rex (the AI) can only ever DISCUSS the market. It never places trades.
+#   • EVERY user connects and trades on their OWN Binance account — nobody's
+#     trade ever touches anyone else's funds, including the bot owner's.
+#   • Each user's API key/secret is collected only in a private DM (never a
+#     group), encrypted at rest, and only decrypted in-memory to make that
+#     specific user's own API calls.
+#   • Trade execution only happens via /trade + an explicit Confirm tap —
+#     no autonomous execution path exists anywhere in this code.
 
 try:
     from binance import AsyncClient as BinanceAsyncClient
@@ -894,35 +906,109 @@ try:
 except ImportError:
     BINANCE_AVAILABLE = False
 
-BINANCE_API_KEY    = os.environ.get('BINANCE_API_KEY', '')
-BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
-BINANCE_TESTNET    = os.environ.get('BINANCE_TESTNET', 'true').lower() != 'false'
+try:
+    from cryptography.fernet import Fernet
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
 
-binance_client = None  # set at startup by init_binance_client()
+BINANCE_TESTNET        = os.environ.get('BINANCE_TESTNET', 'true').lower() != 'false'
+BINANCE_ENCRYPTION_KEY = os.environ.get('BINANCE_ENCRYPTION_KEY', '')
+DATA_DIR               = os.environ.get('DATA_DIR', '.')
+USER_KEYS_FILE         = os.path.join(DATA_DIR, 'binance_user_keys.enc.json')
+
+fernet = None
+if CRYPTOGRAPHY_AVAILABLE and BINANCE_ENCRYPTION_KEY:
+    try:
+        fernet = Fernet(BINANCE_ENCRYPTION_KEY.encode())
+    except Exception as e:
+        logger.error(f"❌ BINANCE_ENCRYPTION_KEY is invalid: {e}")
+
+binance_client = None          # shared client for PUBLIC data only (prices) — no secrets needed
+user_binance_clients = {}      # {user_id: authenticated AsyncClient} — cached per user
 
 async def init_binance_client():
-    """Connects to Binance (testnet by default) if keys are configured.
-    Safe to call even if the package/keys aren't set — just leaves the
-    client as None and features quietly stay disabled."""
+    """Connects a shared client for public market data (prices, candles) —
+    this needs no credentials at all, so it works for everyone regardless
+    of whether they've personally connected an account yet."""
     global binance_client
     if not BINANCE_AVAILABLE:
         logger.info("ℹ️ Binance not configured — 'python-binance' package isn't installed (check requirements.txt)")
         return
-    if not BINANCE_API_KEY:
-        logger.info("ℹ️ Binance not configured — BINANCE_API_KEY is empty/missing")
-        return
-    if not BINANCE_API_SECRET:
-        logger.info("ℹ️ Binance not configured — BINANCE_API_SECRET is empty/missing")
-        return
     try:
-        binance_client = await BinanceAsyncClient.create(
-            BINANCE_API_KEY, BINANCE_API_SECRET, testnet=BINANCE_TESTNET
-        )
+        binance_client = await BinanceAsyncClient.create(testnet=BINANCE_TESTNET)
         mode = "TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
-        logger.info(f"✅ Binance connected — mode: {mode}")
+        logger.info(f"✅ Binance public data client connected — mode: {mode}")
     except Exception as e:
         logger.error(f"❌ Binance connection failed: {e}")
         binance_client = None
+
+# ── Per-user encrypted credential storage ───────────────────────
+def _load_user_keys_store():
+    if not os.path.exists(USER_KEYS_FILE):
+        return {}
+    try:
+        with open(USER_KEYS_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"❌ Could not read user keys store: {e}")
+        return {}
+
+def _save_user_keys_store(store):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(USER_KEYS_FILE, 'w') as f:
+        json.dump(store, f)
+
+def save_user_binance_keys(user_id, api_key, api_secret):
+    if not fernet:
+        raise RuntimeError("BINANCE_ENCRYPTION_KEY isn't configured")
+    store = _load_user_keys_store()
+    store[str(user_id)] = {
+        "api_key": fernet.encrypt(api_key.encode()).decode(),
+        "api_secret": fernet.encrypt(api_secret.encode()).decode(),
+    }
+    _save_user_keys_store(store)
+
+def get_user_binance_keys(user_id):
+    if not fernet:
+        return None
+    store = _load_user_keys_store()
+    entry = store.get(str(user_id))
+    if not entry:
+        return None
+    return {
+        "api_key": fernet.decrypt(entry["api_key"].encode()).decode(),
+        "api_secret": fernet.decrypt(entry["api_secret"].encode()).decode(),
+    }
+
+def delete_user_binance_keys(user_id):
+    store = _load_user_keys_store()
+    if store.pop(str(user_id), None) is not None:
+        _save_user_keys_store(store)
+
+def mask_key(key):
+    if not key or len(key) < 8:
+        return "••••"
+    return f"{key[:4]}…{key[-4:]}"
+
+async def get_user_binance_client(user_id):
+    """Returns this specific user's own authenticated Binance client,
+    creating and caching it from their encrypted stored credentials.
+    Returns None if they haven't connected an account yet."""
+    if user_id in user_binance_clients:
+        return user_binance_clients[user_id]
+    creds = get_user_binance_keys(user_id)
+    if not creds:
+        return None
+    try:
+        client = await BinanceAsyncClient.create(
+            creds["api_key"], creds["api_secret"], testnet=BINANCE_TESTNET
+        )
+        user_binance_clients[user_id] = client
+        return client
+    except Exception as e:
+        logger.error(f"❌ Could not connect Binance client for user {user_id}: {e}")
+        return None
 
 # Common name -> Binance symbol mapping, so "how's bitcoin doing" works
 # without the user needing to type the exact ticker.
@@ -1076,19 +1162,199 @@ async def handle_trade_flow_text(event, bot):
 
     return False
 
+# ── Per-user Binance account connection flow (private chat only) ────
+binance_connect_state = {}  # {user_id: {"step": "awaiting_api_key"/"awaiting_api_secret", "api_key": ...}}
+
+async def handle_binance_connect_text(event, bot):
+    """Continues the /connectbinance flow when the user pastes their API
+    key or secret as plain text. Returns True if it handled the message."""
+    state = binance_connect_state.get(event.sender_id)
+    if not state:
+        return False
+
+    text = event.raw_text.strip()
+
+    if state["step"] == "awaiting_api_key":
+        binance_connect_state[event.sender_id] = {"step": "awaiting_api_secret", "api_key": text}
+        await event.respond("🔐 Got it. Now paste your API *Secret* key:", parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_api_secret":
+        api_key = state["api_key"]
+        api_secret = text
+        binance_connect_state.pop(event.sender_id, None)
+
+        if not fernet:
+            await event.respond(
+                "⚠️ The bot owner hasn't finished setting this up yet "
+                "(BINANCE_ENCRYPTION_KEY missing) — let them know."
+            )
+            return True
+
+        await event.respond("🔄 Verifying your keys with Binance...")
+        try:
+            test_client = await BinanceAsyncClient.create(api_key, api_secret, testnet=BINANCE_TESTNET)
+            await test_client.get_account()  # raises if the credentials are invalid
+        except Exception:
+            await event.respond(
+                "❌ Couldn't verify those keys — double check them and run /connectbinance again.\n\n"
+                "Common causes: typo, key not yet active, or 'Enable Spot & Margin Trading' wasn't checked."
+            )
+            return True
+
+        save_user_binance_keys(event.sender_id, api_key, api_secret)
+        user_binance_clients[event.sender_id] = test_client
+        mode_label = "🧪 TESTNET" if BINANCE_TESTNET else "⚠️ LIVE"
+        await event.respond(
+            f"✅ *Connected!* ({mode_label})\n\n"
+            f"Your keys are encrypted and stored — only used for *your own* trades and balance.\n\n"
+            f"Try /balance to see your account. Use /disconnectbinance anytime to remove your keys.",
+            parse_mode='markdown'
+        )
+        return True
+
+    return False
+
+def setup_binance_account_handlers(bot):
+    """Registers /connectbinance, /disconnectbinance, /mybinance."""
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/connectbinance$'))
+    async def connect_binance_handler(event):
+        if not event.is_private:
+            await event.respond("🔐 For your security, please message me privately to connect your Binance account — not in a group.")
+            return
+        if not BINANCE_AVAILABLE:
+            await event.respond("📊 Live trading isn't available yet — the bot owner needs to install python-binance. 🔧")
+            return
+        if not fernet:
+            await event.respond("📊 Live trading isn't fully set up yet — the bot owner needs to add BINANCE_ENCRYPTION_KEY. 🔧")
+            return
+        binance_connect_state[event.sender_id] = {"step": "awaiting_api_key"}
+        await event.respond(
+            "🔐 *Connect Your Binance Account*\n\n"
+            "This is a private chat, just between you and the bot.\n\n"
+            "Paste your Binance API *Key* now.\n\n"
+            "⚠️ Make sure the key only has *Read* and *Spot & Margin Trading* enabled — "
+            "never one with *Withdrawals* enabled.",
+            buttons=[[Button.inline("📖 How do I get my API key?", b"binance:apiguide")]],
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"binance:apiguide"))
+    async def binance_api_guide_callback(event):
+        await event.answer()
+        mode_note = (
+            "🧪 *This bot is currently in TESTNET mode* (fake money) — use the testnet "
+            "steps below to practice safely.\n\n"
+            if BINANCE_TESTNET else
+            "⚠️ *This bot is currently in LIVE mode* (real money) — use the live steps "
+            "below carefully.\n\n"
+        )
+        await event.respond(
+            f"📖 *How to Get Your Binance API Key*\n\n{mode_note}"
+            "🧪 *Testnet (fake money, practice safely):*\n"
+            "1️⃣ Go to testnet.binance.vision\n"
+            "2️⃣ Log in with GitHub\n"
+            "3️⃣ Click 'Generate HMAC_SHA256 Key'\n"
+            "4️⃣ Tick ✅ TRADE, ✅ USER_DATA, ✅ USER_STREAM\n"
+            "5️⃣ Click Generate, copy both keys shown\n\n"
+            "💰 *Live (real Binance account, real money):*\n"
+            "1️⃣ Log into binance.com\n"
+            "2️⃣ Profile icon → API Management\n"
+            "3️⃣ Click 'Create API' → System generated\n"
+            "4️⃣ Complete 2FA verification\n"
+            "5️⃣ Enable ONLY: ✅ Reading, ✅ Spot & Margin Trading\n"
+            "6️⃣ Leave ❌ Withdrawals OFF — always\n"
+            "7️⃣ Copy both keys shown (secret shown only once!)\n\n"
+            "Once you have both keys, come back here and send /connectbinance to continue. 🔐",
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/disconnectbinance$'))
+    async def disconnect_binance_handler(event):
+        delete_user_binance_keys(event.sender_id)
+        user_binance_clients.pop(event.sender_id, None)
+        await event.respond("🔓 Your Binance keys have been deleted from storage.")
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/mybinance$'))
+    async def my_binance_status_handler(event):
+        creds = get_user_binance_keys(event.sender_id)
+        if not creds:
+            await event.respond("You haven't connected a Binance account yet. Use /connectbinance to set it up. 🔐")
+            return
+        await event.respond(
+            f"✅ Connected — API key: `{mask_key(creds['api_key'])}`\n\nUse /disconnectbinance to remove it.",
+            parse_mode='markdown'
+        )
+
+    logger.info("✅ Binance account handlers registered (/connectbinance, /disconnectbinance, /mybinance)")
+
 def setup_binance_trading_handler(bot):
-    """Registers the /trade command, the guided button flow, and the
-    Confirm/Cancel callbacks. This is the ONLY code path that can place a
-    real order — and it only fires after the user explicitly taps Confirm
-    on a proposal built from live-fetched data."""
+    """Registers the /trade command, the guided button flow, the
+    Confirm/Cancel callbacks, and /balance for checking your account.
+    /trade + Confirm is the ONLY code path that can place a real order."""
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/balance$'))
+    async def balance_command_handler(event):
+        client = await get_user_binance_client(event.sender_id)
+        if not client:
+            await event.respond("You haven't connected a Binance account yet. Use /connectbinance to set it up. 🔐")
+            return
+
+        try:
+            account = await client.get_account()
+        except Exception as e:
+            await event.respond(f"⚠️ Couldn't fetch account info: {e}")
+            return
+
+        # Only show assets you actually hold (free or locked > 0)
+        holdings = [
+            b for b in account.get('balances', [])
+            if float(b['free']) > 0 or float(b['locked']) > 0
+        ]
+
+        mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
+        if not holdings:
+            await event.respond(f"📊 *Your Balance* — {mode_label}\n\nNo assets found.", parse_mode='markdown')
+            return
+
+        lines = [f"• {b['asset']}: {float(b['free']):,.6f}" for b in holdings[:20]]
+        await event.respond(
+            f"📊 *Your Balance* — {mode_label}\n\n" + "\n".join(lines),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/orders$'))
+    async def orders_command_handler(event):
+        client = await get_user_binance_client(event.sender_id)
+        if not client:
+            await event.respond("You haven't connected a Binance account yet. Use /connectbinance to set it up. 🔐")
+            return
+
+        try:
+            open_orders = await client.get_open_orders()
+        except Exception as e:
+            await event.respond(f"⚠️ Couldn't fetch open orders: {e}")
+            return
+
+        mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
+        if not open_orders:
+            await event.respond(f"📊 *Your Open Orders* — {mode_label}\n\nNone right now — all your orders have filled.", parse_mode='markdown')
+            return
+
+        lines = [f"• {o['symbol']} {o['side']} {o['origQty']} @ {o.get('price', 'MARKET')}" for o in open_orders[:20]]
+        await event.respond(
+            f"📊 *Your Open Orders* — {mode_label}\n\n" + "\n".join(lines),
+            parse_mode='markdown'
+        )
 
     @bot.on(events.NewMessage(incoming=True, pattern=TRADE_COMMAND_PATTERN))
     async def trade_command_handler(event):
         if not binance_client:
-            await event.respond(
-                "📊 Live trading isn't set up yet — the bot owner needs to add "
-                "BINANCE_API_KEY and BINANCE_API_SECRET. 🔧"
-            )
+            await event.respond("📊 Live trading isn't set up yet — the bot owner needs to install python-binance. 🔧")
+            return
+        if not await get_user_binance_client(event.sender_id):
+            await event.respond("You haven't connected a Binance account yet. Use /connectbinance to set it up. 🔐")
             return
 
         symbol = event.pattern_match.group(1).upper()
@@ -1106,8 +1372,13 @@ def setup_binance_trading_handler(bot):
     async def trade_menu_callback(event):
         if not binance_client:
             await event.edit(
-                "📊 Live trading isn't set up yet — the bot owner needs to add "
-                "BINANCE_API_KEY and BINANCE_API_SECRET. 🔧",
+                "📊 Live trading isn't set up yet — the bot owner needs to install python-binance. 🔧",
+                buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]]
+            )
+            return
+        if not await get_user_binance_client(event.sender_id):
+            await event.edit(
+                "📊 You haven't connected a Binance account yet.\n\nUse /connectbinance to set it up (it's quick, and your keys are encrypted). 🔐",
                 buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]]
             )
             return
@@ -1147,9 +1418,14 @@ def setup_binance_trading_handler(bot):
             await event.answer("No pending trade found — it may have expired.", alert=True)
             return
 
+        client = await get_user_binance_client(event.sender_id)
+        if not client:
+            await event.answer("You haven't connected a Binance account. Use /connectbinance first.", alert=True)
+            return
+
         await event.answer("Placing order...")
         try:
-            order = await binance_client.create_order(
+            order = await client.create_order(
                 symbol=trade["symbol"],
                 side=trade["side"],
                 type="MARKET",
@@ -1213,8 +1489,9 @@ def setup_agent_handler(bot):
         func=lambda e: e.is_private and bool(e.raw_text) and not e.raw_text.startswith('/')
     ))
     async def agent_message_handler(event):
-        handled = await handle_trade_flow_text(event, bot)
-        if handled:
+        if await handle_binance_connect_text(event, bot):
+            return
+        if await handle_trade_flow_text(event, bot):
             return
 
         if not gemini_model:
@@ -1319,6 +1596,7 @@ async def run_bot():
     setup_agent_handler(bot)
     # ── Binance live data + manually-confirmed trading ────
     await init_binance_client()
+    setup_binance_account_handlers(bot)
     setup_binance_trading_handler(bot)
     await resolve_signal_groups(bot)
 
