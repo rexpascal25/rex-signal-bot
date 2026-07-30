@@ -905,8 +905,14 @@ async def init_binance_client():
     Safe to call even if the package/keys aren't set — just leaves the
     client as None and features quietly stay disabled."""
     global binance_client
-    if not (BINANCE_AVAILABLE and BINANCE_API_KEY and BINANCE_API_SECRET):
-        logger.info("ℹ️ Binance not configured — live trading features disabled")
+    if not BINANCE_AVAILABLE:
+        logger.info("ℹ️ Binance not configured — 'python-binance' package isn't installed (check requirements.txt)")
+        return
+    if not BINANCE_API_KEY:
+        logger.info("ℹ️ Binance not configured — BINANCE_API_KEY is empty/missing")
+        return
+    if not BINANCE_API_SECRET:
+        logger.info("ℹ️ Binance not configured — BINANCE_API_SECRET is empty/missing")
         return
     try:
         binance_client = await BinanceAsyncClient.create(
