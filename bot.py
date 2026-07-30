@@ -508,6 +508,7 @@ def main_menu_buttons():
         [Button.inline("🔗 Register", b"menu:register")],
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
         [Button.inline("🤖 Market Analyst", b"menu:analyst")],
+        [Button.inline("📊 Trade", b"menu:trade")],
     ]
 
 def strategy_list_buttons():
@@ -869,12 +870,319 @@ def clean_for_telegram(text):
 
     return result.strip()
 
+# ══════════════════════════════════════════════════════════════
+# NEW: Binance live market data + manually-confirmed trading
+# ══════════════════════════════════════════════════════════════
+#
+# Setup:
+#   1. pip install python-binance
+#   2. Create API keys at https://www.binance.com/en/my/settings/api-management
+#      (or https://testnet.binance.vision for a safe fake-money testnet account)
+#   3. Set env vars BINANCE_API_KEY and BINANCE_API_SECRET
+#   4. BINANCE_TESTNET defaults to "true" — trades use fake testnet money
+#      until you deliberately set it to "false". Test thoroughly first.
+#
+# SAFETY DESIGN: Rex (the AI) can only ever DISCUSS the market using real
+# live data. It cannot place trades. Trade execution only happens through
+# the explicit /trade command below, and ONLY after the user taps a
+# Confirm button — there is no code path where a trade fires automatically.
+
+try:
+    from binance import AsyncClient as BinanceAsyncClient
+    from binance.exceptions import BinanceAPIException
+    BINANCE_AVAILABLE = True
+except ImportError:
+    BINANCE_AVAILABLE = False
+
+BINANCE_API_KEY    = os.environ.get('BINANCE_API_KEY', '')
+BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
+BINANCE_TESTNET    = os.environ.get('BINANCE_TESTNET', 'true').lower() != 'false'
+
+binance_client = None  # set at startup by init_binance_client()
+
+async def init_binance_client():
+    """Connects to Binance (testnet by default) if keys are configured.
+    Safe to call even if the package/keys aren't set — just leaves the
+    client as None and features quietly stay disabled."""
+    global binance_client
+    if not (BINANCE_AVAILABLE and BINANCE_API_KEY and BINANCE_API_SECRET):
+        logger.info("ℹ️ Binance not configured — live trading features disabled")
+        return
+    try:
+        binance_client = await BinanceAsyncClient.create(
+            BINANCE_API_KEY, BINANCE_API_SECRET, testnet=BINANCE_TESTNET
+        )
+        mode = "TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
+        logger.info(f"✅ Binance connected — mode: {mode}")
+    except Exception as e:
+        logger.error(f"❌ Binance connection failed: {e}")
+        binance_client = None
+
+# Common name -> Binance symbol mapping, so "how's bitcoin doing" works
+# without the user needing to type the exact ticker.
+COMMON_SYMBOL_ALIASES = {
+    'btc': 'BTCUSDT', 'bitcoin': 'BTCUSDT',
+    'eth': 'ETHUSDT', 'ethereum': 'ETHUSDT',
+    'sol': 'SOLUSDT', 'solana': 'SOLUSDT',
+    'bnb': 'BNBUSDT', 'binance coin': 'BNBUSDT',
+    'xrp': 'XRPUSDT', 'ripple': 'XRPUSDT',
+    'doge': 'DOGEUSDT', 'dogecoin': 'DOGEUSDT',
+    'ada': 'ADAUSDT', 'cardano': 'ADAUSDT',
+}
+SYMBOL_PATTERN = re.compile(r'\b[A-Z]{2,10}USDT\b')
+
+def detect_binance_symbols(text):
+    """Finds up to 3 Binance symbols mentioned in free text, either as a
+    raw ticker (BTCUSDT) or a common name (bitcoin, eth, etc.)."""
+    found = []
+    for m in SYMBOL_PATTERN.findall(text.upper()):
+        if m not in found:
+            found.append(m)
+    lower = text.lower()
+    for alias, sym in COMMON_SYMBOL_ALIASES.items():
+        if re.search(rf'\b{re.escape(alias)}\b', lower) and sym not in found:
+            found.append(sym)
+    return found[:3]
+
+async def fetch_binance_snapshot(symbol):
+    """Read-only: current price + recent 15-minute candle trend for a symbol."""
+    ticker = await binance_client.get_symbol_ticker(symbol=symbol)
+    klines = await binance_client.get_klines(symbol=symbol, interval='15m', limit=8)
+    closes = [float(k[4]) for k in klines]
+    change_pct = round(((closes[-1] - closes[0]) / closes[0]) * 100, 2) if len(closes) >= 2 else 0.0
+    return {
+        "symbol": symbol,
+        "price": ticker['price'],
+        "change_last_2h_pct": change_pct,
+    }
+
+async def build_live_data_context(user_text):
+    """Detects any Binance symbols mentioned in the message, fetches live
+    snapshots for each, and returns a text block to ground Rex's reply in
+    real numbers. Returns '' if Binance isn't connected or nothing found."""
+    if not binance_client:
+        return ''
+    symbols = detect_binance_symbols(user_text)
+    if not symbols:
+        return ''
+    lines = []
+    for symbol in symbols:
+        try:
+            snap = await fetch_binance_snapshot(symbol)
+            lines.append(
+                f"{snap['symbol']}: ${snap['price']} "
+                f"({snap['change_last_2h_pct']:+.2f}% over the last ~2h)"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Could not fetch live data for {symbol}: {e}")
+    if not lines:
+        return ''
+    return "\n[LIVE BINANCE DATA — use these real current numbers, don't invent your own]\n" + "\n".join(lines)
+
+# ── Manually-confirmed trade execution ──────────────────────────
+pending_trades = {}   # {user_id: {"symbol", "side", "quantity"}}
+trade_flow_state = {} # {user_id: {"step": "awaiting_symbol_text"/"awaiting_quantity", "symbol":.., "side":..}}
+
+TRADE_COMMAND_PATTERN = re.compile(
+    r'^/trade\s+([A-Za-z0-9]+)\s+(BUY|SELL)\s+([\d.]+)\s*$', re.IGNORECASE
+)
+
+QUICK_TRADE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
+async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity):
+    """Fetches the live price and shows a Confirm/Cancel proposal card.
+    Shared by both the /trade command and the guided button flow — this
+    is the single place a pending trade gets created."""
+    try:
+        ticker = await binance_client.get_symbol_ticker(symbol=symbol)
+        price = float(ticker['price'])
+    except Exception as e:
+        await bot.send_message(
+            chat,
+            f"⚠️ Couldn't find live price for *{symbol}* — check the symbol is correct. ({e})",
+            parse_mode='markdown'
+        )
+        return
+
+    estimated_cost = price * quantity
+    pending_trades[user_id] = {"symbol": symbol, "side": side, "quantity": quantity}
+
+    mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
+    await bot.send_message(
+        chat,
+        f"📊 *Trade Proposal* — {mode_label}\n\n"
+        f"• Symbol: *{symbol}*\n"
+        f"• Side: *{side}*\n"
+        f"• Quantity: *{quantity}*\n"
+        f"• Current price: *${price:,.4f}*\n"
+        f"• Estimated cost: *${estimated_cost:,.2f}*\n\n"
+        f"Nothing happens until you confirm. 👇",
+        buttons=[[Button.inline("✅ Confirm", b"trade:confirm"),
+                  Button.inline("❌ Cancel", b"trade:cancel")]],
+        parse_mode='markdown'
+    )
+
+def trade_symbol_buttons():
+    rows = [[Button.inline(f"💰 {s}", f"trade:symbol:{s}".encode())] for s in QUICK_TRADE_SYMBOLS]
+    rows.append([Button.inline("✏️ Type a different symbol", b"trade:symbol:other")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def trade_side_buttons(symbol):
+    return [
+        [Button.inline("🟢 BUY", f"trade:side:{symbol}:BUY".encode()),
+         Button.inline("🔴 SELL", f"trade:side:{symbol}:SELL".encode())],
+        [Button.inline("🏠 Main Menu", b"menu:main")]
+    ]
+
+async def handle_trade_flow_text(event, bot):
+    """Continues the guided trade flow when the user types a symbol or
+    quantity as a plain text reply. Returns True if it handled the
+    message (so the caller knows NOT to also send it to Rex)."""
+    state = trade_flow_state.get(event.sender_id)
+    if not state:
+        return False
+
+    text = event.raw_text.strip()
+
+    if state["step"] == "awaiting_symbol_text":
+        symbol = text.upper()
+        if not re.fullmatch(r'[A-Z0-9]{3,15}', symbol):
+            await event.respond("⚠️ That doesn't look like a valid symbol — try something like `BTCUSDT`.", parse_mode='markdown')
+            return True
+        trade_flow_state[event.sender_id] = {"step": "awaiting_side", "symbol": symbol}
+        await event.respond(f"📊 *{symbol}* — Buy or Sell?", buttons=trade_side_buttons(symbol), parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_quantity":
+        try:
+            quantity = float(text)
+            if quantity <= 0:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Please type a valid number for the quantity, e.g. `0.001`", parse_mode='markdown')
+            return True
+        symbol, side = state["symbol"], state["side"]
+        trade_flow_state.pop(event.sender_id, None)
+        chat = await event.get_chat()
+        await send_trade_confirmation(bot, chat, event.sender_id, symbol, side, quantity)
+        return True
+
+    return False
+
+def setup_binance_trading_handler(bot):
+    """Registers the /trade command, the guided button flow, and the
+    Confirm/Cancel callbacks. This is the ONLY code path that can place a
+    real order — and it only fires after the user explicitly taps Confirm
+    on a proposal built from live-fetched data."""
+
+    @bot.on(events.NewMessage(incoming=True, pattern=TRADE_COMMAND_PATTERN))
+    async def trade_command_handler(event):
+        if not binance_client:
+            await event.respond(
+                "📊 Live trading isn't set up yet — the bot owner needs to add "
+                "BINANCE_API_KEY and BINANCE_API_SECRET. 🔧"
+            )
+            return
+
+        symbol = event.pattern_match.group(1).upper()
+        side = event.pattern_match.group(2).upper()
+        try:
+            quantity = float(event.pattern_match.group(3))
+        except ValueError:
+            await event.respond("⚠️ Couldn't read that quantity — try `/trade BTCUSDT BUY 0.001`")
+            return
+
+        chat = await event.get_chat()
+        await send_trade_confirmation(bot, chat, event.sender_id, symbol, side, quantity)
+
+    @bot.on(events.CallbackQuery(data=b"menu:trade"))
+    async def trade_menu_callback(event):
+        if not binance_client:
+            await event.edit(
+                "📊 Live trading isn't set up yet — the bot owner needs to add "
+                "BINANCE_API_KEY and BINANCE_API_SECRET. 🔧",
+                buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]]
+            )
+            return
+        trade_flow_state.pop(event.sender_id, None)
+        await event.edit(
+            "📊 *Trade*\n\nPick a coin to trade:",
+            buttons=trade_symbol_buttons(),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(pattern=rb"^trade:symbol:(.+)$"))
+    async def trade_symbol_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        if choice == "other":
+            trade_flow_state[event.sender_id] = {"step": "awaiting_symbol_text"}
+            await event.edit("✏️ Type the symbol you want to trade, e.g. `BTCUSDT`:", buttons=None, parse_mode='markdown')
+            return
+        symbol = choice
+        trade_flow_state[event.sender_id] = {"step": "awaiting_side", "symbol": symbol}
+        await event.edit(f"📊 *{symbol}* — Buy or Sell?", buttons=trade_side_buttons(symbol), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^trade:side:([^:]+):(BUY|SELL)$"))
+    async def trade_side_callback(event):
+        symbol = event.pattern_match.group(1).decode()
+        side = event.pattern_match.group(2).decode()
+        trade_flow_state[event.sender_id] = {"step": "awaiting_quantity", "symbol": symbol, "side": side}
+        await event.edit(
+            f"📊 *{symbol}* — *{side}*\n\nHow much? Type the quantity, e.g. `0.001`",
+            buttons=None,
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"trade:confirm"))
+    async def trade_confirm_callback(event):
+        trade = pending_trades.pop(event.sender_id, None)
+        if not trade:
+            await event.answer("No pending trade found — it may have expired.", alert=True)
+            return
+
+        await event.answer("Placing order...")
+        try:
+            order = await binance_client.create_order(
+                symbol=trade["symbol"],
+                side=trade["side"],
+                type="MARKET",
+                quantity=trade["quantity"],
+            )
+            await event.edit(
+                f"✅ *Order placed!*\n\n"
+                f"• Symbol: {trade['symbol']}\n"
+                f"• Side: {trade['side']}\n"
+                f"• Quantity: {trade['quantity']}\n"
+                f"• Order ID: `{order.get('orderId', 'n/a')}`",
+                buttons=None,
+                parse_mode='markdown'
+            )
+        except BinanceAPIException as e:
+            await event.edit(f"❌ Order failed: {e.message}", buttons=None)
+        except Exception as e:
+            logger.error(f"❌ Trade execution error: {e}")
+            await event.edit("❌ Something went wrong placing that order. Check the logs.", buttons=None)
+
+    @bot.on(events.CallbackQuery(data=b"trade:cancel"))
+    async def trade_cancel_callback(event):
+        pending_trades.pop(event.sender_id, None)
+        trade_flow_state.pop(event.sender_id, None)
+        await event.edit("🚫 Trade cancelled — nothing was placed.", buttons=None)
+        await event.answer("Cancelled")
+
+    logger.info("✅ Binance trading handler registered (/trade command + guided button flow)")
+
 async def get_agent_reply(user_id, user_text):
     """Calls Gemini with this user's running conversation history and
     returns Rex's reply text. Raises AgentLimitReached if the free daily
     quota has been used up."""
     history = agent_conversations.setdefault(user_id, [])
-    history.append({"role": "user", "parts": [user_text]})
+
+    live_context = await build_live_data_context(user_text)
+    augmented_text = user_text + ("\n" + live_context if live_context else "")
+
+    history.append({"role": "user", "parts": [augmented_text]})
     del history[:-MAX_HISTORY_MESSAGES]  # keep only the most recent messages
 
     try:
@@ -899,6 +1207,10 @@ def setup_agent_handler(bot):
         func=lambda e: e.is_private and bool(e.raw_text) and not e.raw_text.startswith('/')
     ))
     async def agent_message_handler(event):
+        handled = await handle_trade_flow_text(event, bot)
+        if handled:
+            return
+
         if not gemini_model:
             await event.respond(
                 "🤖 The Market Analyst isn't set up yet — the bot owner needs to "
@@ -999,6 +1311,9 @@ async def run_bot():
     setup_menu_handlers(bot)
     # ── Market Analyst agent — now powered by Gemini's free tier ────
     setup_agent_handler(bot)
+    # ── Binance live data + manually-confirmed trading ────
+    await init_binance_client()
+    setup_binance_trading_handler(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
