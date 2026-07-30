@@ -2,3 +2,4 @@ telethon
 google-generativeai
 cryptg
 flask
+python-binance
