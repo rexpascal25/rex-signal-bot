@@ -1081,6 +1081,22 @@ TRADE_COMMAND_PATTERN = re.compile(
 
 QUICK_TRADE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 
+async def get_min_notional(symbol):
+    """Looks up the minimum order value (price × quantity) Binance requires
+    for this symbol. Returns None if it can't be determined."""
+    try:
+        info = await binance_client.get_symbol_info(symbol)
+        if not info:
+            return None
+        for f in info.get('filters', []):
+            if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
+                value = f.get('minNotional') or f.get('notional')
+                if value is not None:
+                    return float(value)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch min notional for {symbol}: {e}")
+    return None
+
 async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity):
     """Fetches the live price and shows a Confirm/Cancel proposal card.
     Shared by both the /trade command and the guided button flow — this
@@ -1097,6 +1113,20 @@ async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity):
         return
 
     estimated_cost = price * quantity
+
+    min_notional = await get_min_notional(symbol)
+    if min_notional is not None and estimated_cost < min_notional:
+        min_quantity = min_notional / price
+        await bot.send_message(
+            chat,
+            f"⚠️ *That order is too small for Binance*\n\n"
+            f"{symbol} requires a minimum order value of *${min_notional:,.2f}*.\n"
+            f"Your order (*{quantity} × ${price:,.4f} = ${estimated_cost:,.2f}*) falls below that.\n\n"
+            f"Try a quantity of at least *{min_quantity:.6f}* (~${min_notional:,.2f}) or more.",
+            parse_mode='markdown'
+        )
+        return
+
     pending_trades[user_id] = {"symbol": symbol, "side": side, "quantity": quantity}
 
     mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
