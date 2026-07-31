@@ -547,6 +547,8 @@ def setup_menu_handlers(bot):
 
     @bot.on(events.NewMessage(pattern=r'^/(start|menu)$'))
     async def start_handler(event):
+        chat = await event.get_chat()
+        await clear_user_chat(bot, chat, event.sender_id)
         await event.respond(
             "👋 *Welcome to Rex Signal Bot!*\n\nChoose an option below:",
             buttons=main_menu_buttons(),
@@ -555,7 +557,10 @@ def setup_menu_handlers(bot):
 
     @bot.on(events.CallbackQuery(data=b"menu:main"))
     async def main_menu_callback(event):
-        await event.edit(
+        chat = await event.get_chat()
+        await clear_user_chat(bot, chat, event.sender_id)
+        await bot.send_message(
+            chat,
             "👋 *Welcome to Rex Signal Bot!*\n\nChoose an option below:",
             buttons=main_menu_buttons(),
             parse_mode='markdown'
@@ -808,6 +813,31 @@ if GEMINI_AVAILABLE and GEMINI_API_KEY:
 
 # Per-user conversation memory: {user_id: [{"role": "user"/"model", "parts": [...]}, ...]}
 agent_conversations = {}
+
+# ── Clean-chat message tracking ─────────────────────────────────
+# Tracks every message the bot sends each user, so tapping "🏠 Main Menu"
+# can sweep the clutter away and show one fresh menu, like professional
+# bots do, instead of leaving a trail of old messages behind.
+user_message_history = {}  # {user_id: [message_id, message_id, ...]}
+MAX_TRACKED_MESSAGES = 300  # safety cap in case someone never taps Main Menu
+
+def track_message(user_id, message):
+    """Records a sent message's ID against the user, for later cleanup."""
+    if message is None:
+        return
+    history = user_message_history.setdefault(user_id, [])
+    history.append(message.id)
+    del history[:-MAX_TRACKED_MESSAGES]
+
+async def clear_user_chat(bot, chat, user_id):
+    """Deletes every tracked message for this user (best-effort — some may
+    already be gone) and clears their tracking history."""
+    history = user_message_history.pop(user_id, [])
+    if history:
+        try:
+            await bot.delete_messages(chat, history)
+        except Exception as e:
+            logger.warning(f"⚠️ Couldn't bulk-delete old messages for user {user_id}: {e}")
 MAX_HISTORY_MESSAGES = 16  # keep the last 8 exchanges per user (trims cost/context)
 
 def time_until_gemini_reset():
@@ -1619,6 +1649,22 @@ async def run_bot():
         logger.error(f"❌ Bot start error: {e}")
         await userbot.disconnect()
         return False
+
+    # ── Auto-track every private message the bot sends, so "🏠 Main Menu"
+    # can clean the chat later. This also covers event.respond(), since it
+    # calls this same underlying method — no need to edit every call site.
+    _original_bot_send_message = bot.send_message
+
+    async def _tracked_bot_send_message(entity, *args, **kwargs):
+        message = await _original_bot_send_message(entity, *args, **kwargs)
+        try:
+            if message and message.is_private:
+                track_message(message.chat_id, message)
+        except Exception as e:
+            logger.warning(f"⚠️ Message tracking failed (non-fatal): {e}")
+        return message
+
+    bot.send_message = _tracked_bot_send_message
 
     # ── NEW: register the Strategy / Materials / Register / Signal Groups menu ────
     setup_menu_handlers(bot)
