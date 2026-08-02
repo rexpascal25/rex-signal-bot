@@ -2365,20 +2365,25 @@ async def execute_autotrade(bot, user_id, symbol, side):
     per-trade stop-loss."""
     session = get_autotrade_session(user_id)
     if not session or not session.get("enabled"):
+        logger.info(f"ℹ️ Auto-trade skip [{symbol}, user {user_id}]: no active session")
         return
     if symbol not in session.get("symbols", []):
+        logger.info(f"ℹ️ Auto-trade skip [{symbol}, user {user_id}]: symbol not in session watchlist {session.get('symbols')}")
         return
     if side != "BUY":
         return  # exits are handled by scan_positions_for_exit_signals, not here
     if session["trades_done"] >= session["max_trades"]:
+        logger.info(f"ℹ️ Auto-trade skip [{symbol}, user {user_id}]: max trades reached ({session['trades_done']}/{session['max_trades']})")
         return
     # Don't stack a second auto-position on a symbol we're already holding
     existing = [p for p in open_positions.get(str(user_id), []) if p["symbol"] == symbol and p.get("is_autotrade")]
     if existing:
+        logger.info(f"ℹ️ Auto-trade skip [{symbol}, user {user_id}]: already holding an auto-trade position on this symbol")
         return
 
     client = await get_user_binance_client(user_id)
     if not client:
+        logger.warning(f"⚠️ Auto-trade skip [{symbol}, user {user_id}]: no connected Binance client (check /mybinance)")
         return
 
     try:
@@ -2396,6 +2401,7 @@ async def execute_autotrade(bot, user_id, symbol, side):
             balance = float(b['free'])
             break
     if balance <= 0:
+        logger.warning(f"⚠️ Auto-trade skip [{symbol}, user {user_id}]: {quote_asset} balance is 0")
         return
 
     # Circuit breaker check — uses the balance snapshotted when the session started
