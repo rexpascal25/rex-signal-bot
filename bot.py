@@ -1549,14 +1549,19 @@ async def analyze_symbol(symbol):
     elif all_down and last_price < last_sma7 and last_price < last_ema45 and last_macd < 0:
         base_verdict = 'SELL'
 
-    # Require the Lorentzian classifier to AGREE before counting as a real
-    # verdict — this raises the bar (fewer, higher-conviction signals)
-    # rather than replacing the already-tested Trending Strategy logic.
+    # Only veto on an ACTIVE contradiction from the Lorentzian layer, not on
+    # it simply having no clear read. The Lorentzian layer bundles 4 of its
+    # own conditions (classifier prediction, volatility filter, regime
+    # filter, kernel confirmation) — requiring it to fully confirm on top
+    # of our own 4-condition trend check was too strict in practice (real
+    # BUY setups were getting vetoed just because the Lorentzian side had
+    # no strong opinion, not because it disagreed).
     verdict = None
     lorentzian_verdict = None
     if base_verdict:
         lorentzian_verdict = await get_lorentzian_signal(symbol)
-        if lorentzian_verdict == base_verdict:
+        opposite = 'SELL' if base_verdict == 'BUY' else 'BUY'
+        if lorentzian_verdict != opposite:
             verdict = base_verdict
 
     return {
@@ -1721,7 +1726,7 @@ def setup_opportunity_alerts_handlers(bot):
             verdict_label = "🟢 BUY setup" if verdict == "BUY" else "🔴 SELL setup" if verdict == "SELL" else "— no setup right now"
             agreement_note = ""
             if base and not verdict:
-                agreement_note = f"\n  ⚖️ Trend indicators say {base}, but Lorentzian layer says {lor or 'no signal'} — need both to agree"
+                agreement_note = f"\n  ⛔ Trend indicators say {base}, but Lorentzian layer actively says {lor} instead — vetoed"
             lines.append(
                 f"*{symbol}* — {verdict_label}\n"
                 f"  Price: ${result['price']:,.4f} | Trend: {result['trend']}\n"
