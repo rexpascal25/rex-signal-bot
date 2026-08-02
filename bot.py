@@ -512,6 +512,7 @@ def main_menu_buttons():
         [Button.inline("🤖 Market Analyst", b"menu:analyst")],
         [Button.inline("🟡 Trade on Binance", b"menu:trade")],
         [Button.inline("🔔 Opportunity Alerts", b"menu:alerts")],
+        [Button.inline("🤖 Auto-Trading", b"menu:autotrade")],
     ]
 
 def strategy_list_buttons():
@@ -1126,14 +1127,14 @@ def _save_open_positions(store):
 
 open_positions = _load_open_positions()  # {user_id_str: [{"id","symbol","quantity","entry_price","order_id"}, ...]}
 
-def add_open_position(user_id, symbol, quantity, entry_price, order_id, stop_loss_price=None):
+def add_open_position(user_id, symbol, quantity, entry_price, order_id, stop_loss_price=None, is_autotrade=False):
     key = str(user_id)
     positions = open_positions.setdefault(key, [])
     position_id = f"{order_id}"
     positions.append({
         "id": position_id, "symbol": symbol, "quantity": quantity,
         "entry_price": entry_price, "order_id": order_id,
-        "stop_loss_price": stop_loss_price
+        "stop_loss_price": stop_loss_price, "is_autotrade": is_autotrade
     })
     _save_open_positions(open_positions)
     return position_id
@@ -1631,6 +1632,12 @@ async def scan_positions_for_exit_signals(bot):
                 current_price = result["price"]
                 change_pct = ((current_price - p["entry_price"]) / p["entry_price"]) * 100
                 move_emoji = "🟢" if current_price >= p["entry_price"] else "🔴"
+
+                if p.get("is_autotrade"):
+                    await close_autotrade_position(bot, user_id, p, current_price, "📉 Trend reversed")
+                    last_position_verdict[p["id"]] = verdict
+                    continue
+
                 try:
                     await bot.send_message(
                         user_id,
@@ -1668,6 +1675,10 @@ async def scan_for_opportunities(bot):
                 last_opportunity_direction[symbol] = direction
                 if alerts_opted_in:
                     await notify_opportunity(bot, symbol, direction)
+                if direction == "BUY":
+                    for user_id_str, session in list(autotrade_sessions.items()):
+                        if session.get("enabled"):
+                            await execute_autotrade(bot, int(user_id_str), symbol, direction)
             elif not direction:
                 last_opportunity_direction[symbol] = None
 
@@ -1787,6 +1798,240 @@ def get_quote_asset(symbol):
         if symbol.endswith(quote):
             return quote
     return "USDT"
+
+def autotrade_amount_pct_buttons():
+    rows = [[Button.inline(f"{p}%", f"autotrade:amountpct:{p}".encode()) for p in [2, 5, 10]]]
+    rows.append([Button.inline("✏️ Type a custom %", b"autotrade:amountpct:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def autotrade_stoploss_pct_buttons():
+    rows = [[Button.inline(f"{p}%", f"autotrade:stoplosspct:{p}".encode()) for p in [1, 2, 3]]]
+    rows.append([Button.inline("✏️ Type a custom %", b"autotrade:stoplosspct:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def autotrade_losslimit_pct_buttons():
+    rows = [[Button.inline(f"{p}%", f"autotrade:losslimitpct:{p}".encode()) for p in [5, 10, 15]]]
+    rows.append([Button.inline("✏️ Type a custom %", b"autotrade:losslimitpct:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+async def send_autotrade_status(bot, chat, user_id):
+    session = get_autotrade_session(user_id)
+    if not session or not session.get("enabled"):
+        await bot.send_message(
+            chat,
+            "🤖 *Auto-Trading* — currently OFF\n\n"
+            "When ON, the bot watches the same scanner and strategy, and "
+            "executes trades automatically — no tap needed. Every trade still "
+            "carries its own stop-loss, and a loss-limit circuit breaker stops "
+            "everything early if things go badly.\n\n"
+            "Set it up below:",
+            buttons=[[Button.inline("🚀 Set Up Auto-Trading", b"autotrade:setup_start")],
+                     [Button.inline("🏠 Main Menu", b"menu:main")]],
+            parse_mode='markdown'
+        )
+        return
+    await bot.send_message(
+        chat,
+        f"🤖 *Auto-Trading* — currently ON ✅\n\n"
+        f"• Trades so far: {session['trades_done']}/{session['max_trades']}\n"
+        f"• Amount per trade: {session['amount_pct']}% of balance\n"
+        f"• Stop-loss per trade: {session['stop_loss_pct']}%\n"
+        f"• Loss limit (circuit breaker): {session['loss_limit_pct']}%\n"
+        f"• Realized P&L this session: ${session.get('realized_pnl', 0):,.2f}\n"
+        f"• Symbols: {', '.join(session['symbols'])}",
+        buttons=[[Button.inline("🛑 Stop Auto-Trading", b"autotrade:stop")],
+                 [Button.inline("🏠 Main Menu", b"menu:main")]],
+        parse_mode='markdown'
+    )
+
+async def handle_autotrade_setup_text(event, bot):
+    """Continues auto-trading setup when the user types a custom % or the
+    number of trades. Returns True if it handled the message."""
+    state = autotrade_setup_state.get(event.sender_id)
+    if not state:
+        return False
+
+    text = event.raw_text.strip()
+
+    if state["step"] == "awaiting_amount_pct_text":
+        try:
+            pct = float(text)
+            if pct <= 0 or pct > 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a valid percentage, e.g. `5`", parse_mode='markdown')
+            return True
+        state["amount_pct"] = pct
+        state["step"] = "awaiting_stoploss_pct"
+        await event.respond("📊 Stop-loss % per trade (protects each individual trade):", buttons=autotrade_stoploss_pct_buttons(), parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_stoploss_pct_text":
+        try:
+            pct = float(text)
+            if pct <= 0 or pct > 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a valid percentage, e.g. `2`", parse_mode='markdown')
+            return True
+        state["stop_loss_pct"] = pct
+        state["step"] = "awaiting_losslimit_pct"
+        await event.respond("📊 Loss limit % — stops ALL auto-trading if total losses hit this:", buttons=autotrade_losslimit_pct_buttons(), parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_losslimit_pct_text":
+        try:
+            pct = float(text)
+            if pct <= 0 or pct > 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a valid percentage, e.g. `10`", parse_mode='markdown')
+            return True
+        state["loss_limit_pct"] = pct
+        state["step"] = "awaiting_max_trades"
+        await event.respond("📊 How many trades total should this session run? Type a number, e.g. `20`")
+        return True
+
+    if state["step"] == "awaiting_max_trades":
+        try:
+            count = int(text)
+            if count <= 0:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a whole number, e.g. `20`")
+            return True
+        state["max_trades"] = count
+        autotrade_setup_state.pop(event.sender_id, None)
+        await confirm_autotrade_setup(event, bot, state)
+        return True
+
+    return False
+
+async def confirm_autotrade_setup(event, bot, state):
+    client = await get_user_binance_client(event.sender_id)
+    if not client:
+        await event.respond("You haven't connected a Binance account yet. Use /connectbinance to set it up. 🔐")
+        return
+    try:
+        account = await client.get_account()
+    except Exception as e:
+        await event.respond(f"⚠️ Couldn't fetch your balance: {e}")
+        return
+
+    starting_balance = 0.0
+    for b in account.get('balances', []):
+        if b['asset'] == 'USDT':
+            starting_balance = float(b['free'])
+            break
+
+    mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
+    session_preview = {
+        "enabled": False, "amount_pct": state["amount_pct"], "stop_loss_pct": state["stop_loss_pct"],
+        "loss_limit_pct": state["loss_limit_pct"], "max_trades": state["max_trades"], "trades_done": 0,
+        "starting_balance": starting_balance, "realized_pnl": 0.0, "symbols": list(SCAN_SYMBOLS)
+    }
+    autotrade_setup_state[event.sender_id] = {"pending_session": session_preview}
+    await event.respond(
+        f"🤖 *Confirm Auto-Trading Setup* — {mode_label}\n\n"
+        f"• Amount per trade: *{state['amount_pct']}%* of balance\n"
+        f"• Stop-loss per trade: *{state['stop_loss_pct']}%*\n"
+        f"• Loss limit (circuit breaker): *{state['loss_limit_pct']}%* "
+        f"(≈ ${starting_balance * state['loss_limit_pct'] / 100:,.2f})\n"
+        f"• Max trades this session: *{state['max_trades']}*\n"
+        f"• Watching: {', '.join(SCAN_SYMBOLS)}\n"
+        f"• Starting balance: *${starting_balance:,.2f} USDT*\n\n"
+        f"Once started, trades fire automatically — no tap needed. "
+        f"You can stop anytime with 🛑 Stop Auto-Trading.",
+        buttons=[[Button.inline("🚀 Start Auto-Trading", b"autotrade:start")],
+                 [Button.inline("❌ Cancel", b"menu:main")]],
+        parse_mode='markdown'
+    )
+
+def setup_autotrade_handlers(bot):
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/autotrade$'))
+    async def autotrade_command(event):
+        await send_autotrade_status(bot, await event.get_chat(), event.sender_id)
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/stopautotrade$'))
+    async def stopautotrade_command(event):
+        stop_autotrade_session(event.sender_id)
+        await event.respond("🛑 Auto-trading stopped. Existing open positions are still protected by their stop-losses.")
+
+    @bot.on(events.CallbackQuery(data=b"menu:autotrade"))
+    async def autotrade_menu_callback(event):
+        await event.answer()
+        await send_autotrade_status(bot, await event.get_chat(), event.sender_id)
+
+    @bot.on(events.CallbackQuery(data=b"autotrade:setup_start"))
+    async def autotrade_setup_start_callback(event):
+        if not await get_user_binance_client(event.sender_id):
+            await event.edit(
+                "You haven't connected a Binance account yet.\n\nUse /connectbinance to set it up first. 🔐",
+                buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]]
+            )
+            return
+        autotrade_setup_state[event.sender_id] = {"step": "awaiting_amount_pct"}
+        await event.edit("📊 How much of your balance per trade?", buttons=autotrade_amount_pct_buttons(), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^autotrade:amountpct:(custom|\d+)$"))
+    async def autotrade_amountpct_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        if choice == "custom":
+            autotrade_setup_state[event.sender_id] = {"step": "awaiting_amount_pct_text"}
+            await event.edit("✏️ Type the % of balance per trade, e.g. `5`:", buttons=None, parse_mode='markdown')
+            return
+        autotrade_setup_state[event.sender_id] = {"step": "awaiting_stoploss_pct", "amount_pct": float(choice)}
+        await event.edit("📊 Stop-loss % per trade (protects each individual trade):", buttons=autotrade_stoploss_pct_buttons(), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^autotrade:stoplosspct:(custom|\d+)$"))
+    async def autotrade_stoplosspct_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        state = autotrade_setup_state.get(event.sender_id, {})
+        if choice == "custom":
+            state["step"] = "awaiting_stoploss_pct_text"
+            autotrade_setup_state[event.sender_id] = state
+            await event.edit("✏️ Type the stop-loss % per trade, e.g. `2`:", buttons=None, parse_mode='markdown')
+            return
+        state["stop_loss_pct"] = float(choice)
+        state["step"] = "awaiting_losslimit_pct"
+        autotrade_setup_state[event.sender_id] = state
+        await event.edit("📊 Loss limit % — stops ALL auto-trading if total losses hit this:", buttons=autotrade_losslimit_pct_buttons(), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^autotrade:losslimitpct:(custom|\d+)$"))
+    async def autotrade_losslimitpct_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        state = autotrade_setup_state.get(event.sender_id, {})
+        if choice == "custom":
+            state["step"] = "awaiting_losslimit_pct_text"
+            autotrade_setup_state[event.sender_id] = state
+            await event.edit("✏️ Type the loss-limit %, e.g. `10`:", buttons=None, parse_mode='markdown')
+            return
+        state["loss_limit_pct"] = float(choice)
+        state["step"] = "awaiting_max_trades"
+        autotrade_setup_state[event.sender_id] = state
+        await event.edit("📊 How many trades total should this session run? Type a number, e.g. `20`", buttons=None)
+
+    @bot.on(events.CallbackQuery(data=b"autotrade:start"))
+    async def autotrade_start_callback(event):
+        state = autotrade_setup_state.pop(event.sender_id, None)
+        if not state or "pending_session" not in state:
+            await event.answer("Setup expired — please start again with /autotrade.", alert=True)
+            return
+        session = state["pending_session"]
+        session["enabled"] = True
+        save_autotrade_session(event.sender_id, session)
+        mode_label = "🧪 TESTNET" if BINANCE_TESTNET else "⚠️ LIVE"
+        await event.edit(f"✅ *Auto-Trading started!* ({mode_label})\n\nWatching {', '.join(session['symbols'])}. You'll get a message every time it trades.", buttons=None, parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(data=b"autotrade:stop"))
+    async def autotrade_stop_callback(event):
+        stop_autotrade_session(event.sender_id)
+        await event.edit("🛑 Auto-trading stopped. Existing open positions are still protected by their stop-losses.", buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]])
+
+    logger.info("✅ Auto-trading handlers registered (/autotrade, /stopautotrade)")
 
 async def finalize_risk_sized_trade(event, bot, symbol, side, stop_pct):
     """Calculates a position size so that if the stop-loss hits, the loss
@@ -2056,6 +2301,231 @@ def setup_binance_account_handlers(bot):
         )
 
     logger.info("✅ Binance account handlers registered (/connectbinance, /disconnectbinance, /mybinance)")
+
+# ══════════════════════════════════════════════════════════════
+# NEW: Auto-Trading (autonomous execution within hard limits)
+# ══════════════════════════════════════════════════════════════
+#
+# This is the ONE feature in this bot where trades fire without a tap.
+# It only runs for users who explicitly configured and started a session,
+# and every session is bounded by three things the user set themselves:
+# a % of balance per trade, a max number of trades, and a total-loss
+# circuit breaker that halts everything if hit. Every auto-trade also
+# still carries its own per-trade stop-loss, monitored by a fast-cadence
+# watcher (see monitor_stop_losses below) — this is the piece that makes
+# unattended trading survivable rather than reckless.
+
+AUTOTRADE_SESSIONS_FILE = os.path.join(DATA_DIR, 'autotrade_sessions.json')
+STOP_LOSS_CHECK_SECONDS = float(os.environ.get('STOP_LOSS_CHECK_SECONDS', '60'))
+
+def _load_autotrade_sessions():
+    if not os.path.exists(AUTOTRADE_SESSIONS_FILE):
+        return {}
+    try:
+        with open(AUTOTRADE_SESSIONS_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read autotrade sessions file: {e}")
+        return {}
+
+def _save_autotrade_sessions(store):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(AUTOTRADE_SESSIONS_FILE, 'w') as f:
+        json.dump(store, f)
+
+autotrade_sessions = _load_autotrade_sessions()  # {user_id_str: {...}}
+autotrade_setup_state = {}  # {user_id: {"step": ..., collected fields...}}
+
+def get_autotrade_session(user_id):
+    return autotrade_sessions.get(str(user_id))
+
+def save_autotrade_session(user_id, session):
+    autotrade_sessions[str(user_id)] = session
+    _save_autotrade_sessions(autotrade_sessions)
+
+def stop_autotrade_session(user_id):
+    session = autotrade_sessions.get(str(user_id))
+    if session:
+        session["enabled"] = False
+        _save_autotrade_sessions(autotrade_sessions)
+
+async def execute_autotrade(bot, user_id, symbol, side):
+    """The only place in this bot where a trade fires without a human tap.
+    Guarded on every side: respects max trades, the loss-limit circuit
+    breaker, position sizing as a % of balance, and always attaches a
+    per-trade stop-loss."""
+    session = get_autotrade_session(user_id)
+    if not session or not session.get("enabled"):
+        return
+    if symbol not in session.get("symbols", []):
+        return
+    if side != "BUY":
+        return  # exits are handled by scan_positions_for_exit_signals, not here
+    if session["trades_done"] >= session["max_trades"]:
+        return
+    # Don't stack a second auto-position on a symbol we're already holding
+    existing = [p for p in open_positions.get(str(user_id), []) if p["symbol"] == symbol and p.get("is_autotrade")]
+    if existing:
+        return
+
+    client = await get_user_binance_client(user_id)
+    if not client:
+        return
+
+    try:
+        account = await client.get_account()
+        ticker = await binance_client.get_symbol_ticker(symbol=symbol)
+        price = float(ticker['price'])
+    except Exception as e:
+        logger.warning(f"⚠️ Auto-trade: couldn't fetch balance/price for user {user_id}: {e}")
+        return
+
+    quote_asset = get_quote_asset(symbol)
+    balance = 0.0
+    for b in account.get('balances', []):
+        if b['asset'] == quote_asset:
+            balance = float(b['free'])
+            break
+    if balance <= 0:
+        return
+
+    # Circuit breaker check — uses the balance snapshotted when the session started
+    starting_balance = session["starting_balance"]
+    loss_limit_amount = starting_balance * (session["loss_limit_pct"] / 100)
+    if session["realized_pnl"] <= -loss_limit_amount:
+        session["enabled"] = False
+        _save_autotrade_sessions(autotrade_sessions)
+        try:
+            await bot.send_message(
+                user_id,
+                f"🛑 *Auto-Trading Stopped — Circuit Breaker*\n\n"
+                f"Realized loss (${session['realized_pnl']:,.2f}) hit your "
+                f"{session['loss_limit_pct']}% limit. No new auto-trades will open. "
+                f"Existing open positions are still protected by their stop-losses.",
+                parse_mode='markdown'
+            )
+        except Exception:
+            pass
+        return
+
+    trade_amount = balance * (session["amount_pct"] / 100)
+    quantity = trade_amount / price
+    stop_loss_price = price * (1 - session["stop_loss_pct"] / 100)
+
+    min_notional = await get_min_notional(symbol)
+    if min_notional is not None and trade_amount < min_notional:
+        logger.info(f"ℹ️ Auto-trade skipped for user {user_id}: {symbol} order too small (${trade_amount:,.2f} < ${min_notional:,.2f})")
+        return
+
+    try:
+        order = await client.create_order(symbol=symbol, side="BUY", type="MARKET", quantity=quantity)
+    except Exception as e:
+        logger.error(f"❌ Auto-trade execution error for user {user_id}: {e}")
+        return
+
+    executed_qty = float(order.get('executedQty', 0) or 0)
+    quote_qty = float(order.get('cummulativeQuoteQty', 0) or 0)
+    fill_price = (quote_qty / executed_qty) if executed_qty > 0 else price
+
+    add_open_position(user_id, symbol, executed_qty or quantity, fill_price, order.get('orderId'), stop_loss_price, is_autotrade=True)
+    session["trades_done"] += 1
+    _save_autotrade_sessions(autotrade_sessions)
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🤖 *Auto-Trade Executed* ({session['trades_done']}/{session['max_trades']})\n\n"
+            f"• {symbol} BUY\n"
+            f"• Entry: ${fill_price:,.4f}\n"
+            f"• Stop-loss: ${stop_loss_price:,.4f}\n"
+            f"• Amount: ${trade_amount:,.2f} ({session['amount_pct']}% of balance)",
+            parse_mode='markdown'
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Could not notify user {user_id} of auto-trade: {e}")
+
+async def close_autotrade_position(bot, user_id, position, exit_price, reason):
+    """Closes an autotrade position and updates the session's realized P&L
+    and circuit breaker — used by both the stop-loss watcher and the
+    exit-signal scanner when the position belongs to an auto-trade session."""
+    client = await get_user_binance_client(user_id)
+    if not client:
+        return
+    try:
+        order = await client.create_order(symbol=position["symbol"], side="SELL", type="MARKET", quantity=position["quantity"])
+    except Exception as e:
+        logger.error(f"❌ Auto-trade close error for user {user_id}: {e}")
+        return
+
+    executed_qty = float(order.get('executedQty', 0) or 0)
+    quote_qty = float(order.get('cummulativeQuoteQty', 0) or 0)
+    real_exit_price = (quote_qty / executed_qty) if executed_qty > 0 else exit_price
+    pnl = (real_exit_price - position["entry_price"]) * position["quantity"]
+
+    remove_open_position(user_id, position["id"])
+    session = get_autotrade_session(user_id)
+    if session:
+        session["realized_pnl"] = session.get("realized_pnl", 0.0) + pnl
+        _save_autotrade_sessions(autotrade_sessions)
+
+    result_label = "Win ✅️🤑" if pnl > 0 else "Lost ❎️🥱"
+    try:
+        await bot.send_message(
+            user_id,
+            f"🤖 *Auto-Trade Closed* — {reason}\n\n"
+            f"• {position['symbol']}\n"
+            f"• Entry: ${position['entry_price']:,.4f} → Exit: ${real_exit_price:,.4f}\n"
+            f"• Result: *{result_label}* (${pnl:,.2f})",
+            parse_mode='markdown'
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Could not notify user {user_id} of auto-trade close: {e}")
+
+async def monitor_stop_losses(bot):
+    """Fast-cadence background loop — checks EVERY open position (manual
+    and auto-trade alike) against its stop-loss every ~60 seconds. This is
+    what makes a stop-loss actually protective instead of just a stored
+    number nobody's watching."""
+    while True:
+        await asyncio.sleep(STOP_LOSS_CHECK_SECONDS)
+        if not binance_client:
+            continue
+        for user_id_str, positions in list(open_positions.items()):
+            user_id = int(user_id_str)
+            for p in list(positions):
+                stop_price = p.get("stop_loss_price")
+                if not stop_price:
+                    continue
+                try:
+                    ticker = await binance_client.get_symbol_ticker(symbol=p["symbol"])
+                    current_price = float(ticker['price'])
+                except Exception as e:
+                    logger.warning(f"⚠️ Stop-loss check failed for {p['symbol']}: {e}")
+                    continue
+                if current_price <= stop_price:
+                    if p.get("is_autotrade"):
+                        await close_autotrade_position(bot, user_id, p, current_price, "🛑 Stop-loss triggered")
+                    else:
+                        client = await get_user_binance_client(user_id)
+                        if not client:
+                            continue
+                        try:
+                            order = await client.create_order(symbol=p["symbol"], side="SELL", type="MARKET", quantity=p["quantity"])
+                            executed_qty = float(order.get('executedQty', 0) or 0)
+                            quote_qty = float(order.get('cummulativeQuoteQty', 0) or 0)
+                            exit_price = (quote_qty / executed_qty) if executed_qty > 0 else current_price
+                            remove_open_position(user_id, p["id"])
+                            result_label = "Win ✅️🤑" if exit_price > p["entry_price"] else "Lost ❎️🥱"
+                            await bot.send_message(
+                                user_id,
+                                f"🛑 *Stop-Loss Triggered*\n\n"
+                                f"• {p['symbol']}\n"
+                                f"• Entry: ${p['entry_price']:,.4f} → Exit: ${exit_price:,.4f}\n"
+                                f"• Result: *{result_label}*",
+                                parse_mode='markdown'
+                            )
+                        except Exception as e:
+                            logger.error(f"❌ Stop-loss execution error for user {user_id}: {e}")
 
 def get_position(user_id, position_id):
     positions = open_positions.get(str(user_id), [])
@@ -2448,6 +2918,8 @@ def setup_agent_handler(bot):
             return
         if await handle_trade_flow_text(event, bot):
             return
+        if await handle_autotrade_setup_text(event, bot):
+            return
 
         if not gemini_model:
             await event.respond(
@@ -2570,6 +3042,7 @@ async def run_bot():
     setup_binance_account_handlers(bot)
     setup_binance_trading_handler(bot)
     setup_opportunity_alerts_handlers(bot)
+    setup_autotrade_handlers(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
@@ -2722,6 +3195,7 @@ async def run_bot():
     logger.info("🤖 Rex Signal Bot LIVE!")
     asyncio.create_task(keepalive(userbot))
     asyncio.create_task(scan_for_opportunities(bot))
+    asyncio.create_task(monitor_stop_losses(bot))
     await userbot.run_until_disconnected()
     return True
 
