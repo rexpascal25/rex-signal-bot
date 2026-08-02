@@ -1537,8 +1537,10 @@ async def analyze_symbol(symbol):
     last_macd = macd_line[-1]
 
     last_directions = ['up' if c > o else 'down' if c < o else 'flat' for o, c in zip(opens[-4:], closes[-4:])]
-    all_up = all(d == 'up' for d in last_directions)
-    all_down = all(d == 'down' for d in last_directions)
+    up_count = sum(1 for d in last_directions if d == 'up')
+    down_count = sum(1 for d in last_directions if d == 'down')
+    all_up = up_count >= 3   # 3-of-4, not a strict 4-of-4 — tolerates one noisy candle inside a real trend
+    all_down = down_count >= 3
     trend = "up" if all_up else "down" if all_down else "mixed (ranging)"
 
     base_verdict = None
