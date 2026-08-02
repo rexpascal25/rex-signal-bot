@@ -8,6 +8,7 @@ import asyncio
 import re
 import os
 import json
+import math
 import logging
 
 # ── Logging setup ──────────────────────────────────────────────
@@ -510,6 +511,7 @@ def main_menu_buttons():
         [Button.inline("📡 Signal Groups", b"menu:signal_groups")],
         [Button.inline("🤖 Market Analyst", b"menu:analyst")],
         [Button.inline("🟡 Trade on Binance", b"menu:trade")],
+        [Button.inline("🔔 Opportunity Alerts", b"menu:alerts")],
     ]
 
 def strategy_list_buttons():
@@ -1103,6 +1105,45 @@ async def build_live_data_context(user_text):
 
 # ── Manually-confirmed trade execution ──────────────────────────
 pending_trades = {}   # {user_id: {"symbol", "side", "quantity"}}
+
+# ── Open position tracking (for live 🟢/🔴 status + Win/Loss on close) ──
+OPEN_POSITIONS_FILE = os.path.join(DATA_DIR, 'open_positions.json')
+
+def _load_open_positions():
+    if not os.path.exists(OPEN_POSITIONS_FILE):
+        return {}
+    try:
+        with open(OPEN_POSITIONS_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read open positions file: {e}")
+        return {}
+
+def _save_open_positions(store):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(OPEN_POSITIONS_FILE, 'w') as f:
+        json.dump(store, f)
+
+open_positions = _load_open_positions()  # {user_id_str: [{"id","symbol","quantity","entry_price","order_id"}, ...]}
+
+def add_open_position(user_id, symbol, quantity, entry_price, order_id, stop_loss_price=None):
+    key = str(user_id)
+    positions = open_positions.setdefault(key, [])
+    position_id = f"{order_id}"
+    positions.append({
+        "id": position_id, "symbol": symbol, "quantity": quantity,
+        "entry_price": entry_price, "order_id": order_id,
+        "stop_loss_price": stop_loss_price
+    })
+    _save_open_positions(open_positions)
+    return position_id
+
+def remove_open_position(user_id, position_id):
+    key = str(user_id)
+    positions = open_positions.get(key, [])
+    open_positions[key] = [p for p in positions if p["id"] != position_id]
+    _save_open_positions(open_positions)
+    last_position_verdict.pop(position_id, None)
 trade_flow_state = {} # {user_id: {"step": "awaiting_symbol_text"/"awaiting_quantity", "symbol":.., "side":..}}
 
 TRADE_COMMAND_PATTERN = re.compile(
@@ -1110,6 +1151,618 @@ TRADE_COMMAND_PATTERN = re.compile(
 )
 
 QUICK_TRADE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
+# ══════════════════════════════════════════════════════════════
+# NEW: Opportunity scanner (proactive detection, manual confirm only)
+# ══════════════════════════════════════════════════════════════
+#
+# This scans a watchlist on a timer and DMs opted-in, Binance-connected
+# users when a simple pattern-based setup shows up. It is a heuristic,
+# NOT a guarantee — same honesty as everywhere else in this bot. And
+# critically: it only ever ASKS. It reuses the exact same manual
+# quantity-entry + Confirm flow as everything else — there is still no
+# code path where a trade fires without a human tapping Confirm.
+
+SCAN_SYMBOLS = [s.strip().upper() for s in os.environ.get('SCAN_SYMBOLS', 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT').split(',') if s.strip()]
+SCAN_INTERVAL_MINUTES = float(os.environ.get('SCAN_INTERVAL_MINUTES', '15'))
+SCAN_KLINE_INTERVAL = os.environ.get('SCAN_KLINE_INTERVAL', '15m')
+
+ALERTS_OPT_IN_FILE = os.path.join(DATA_DIR, 'alerts_opt_in.json')
+
+def _load_opt_in_set():
+    if not os.path.exists(ALERTS_OPT_IN_FILE):
+        return set()
+    try:
+        with open(ALERTS_OPT_IN_FILE) as f:
+            return set(json.load(f))
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read alerts opt-in file: {e}")
+        return set()
+
+def _save_opt_in_set(id_set):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(ALERTS_OPT_IN_FILE, 'w') as f:
+        json.dump(list(id_set), f)
+
+alerts_opted_in = _load_opt_in_set()
+last_opportunity_direction = {}  # {symbol: "BUY"/"SELL"/None} — avoids re-alerting every cycle
+
+def ema_series(values, period):
+    """Exponential moving average, seeded with a simple average of the
+    first `period` values (standard EMA construction)."""
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(values[:period]) / period]
+    for price in values[period:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+    return ema
+
+def sma_series(values, period):
+    if len(values) < period:
+        return []
+    return [sum(values[i - period + 1:i + 1]) / period for i in range(period - 1, len(values))]
+
+def compute_macd(closes, fast=8, slow=12, signal=9):
+    """Returns (macd_line, signal_line, histogram) using the same periods
+    taught in the Trending Strategy: input 8, slope 12, signal 9."""
+    ema_fast = ema_series(closes, fast)
+    ema_slow = ema_series(closes, slow)
+    if not ema_fast or not ema_slow:
+        return [], [], []
+    offset = slow - fast
+    ema_fast_aligned = ema_fast[offset:]
+    macd_line = [f - s for f, s in zip(ema_fast_aligned, ema_slow)]
+    signal_line = ema_series(macd_line, signal)
+    if not signal_line:
+        return macd_line, [], []
+    macd_aligned = macd_line[signal - 1:]
+    histogram = [m - s for m, s in zip(macd_aligned, signal_line)]
+    return macd_aligned, signal_line, histogram
+
+LC_MISSING = float('nan')
+
+def lc_is_missing(v):
+    return isinstance(v, float) and math.isnan(v)
+
+def lc_nz(v, fallback=0.0):
+    return fallback if lc_is_missing(v) else v
+
+def lc_ema(src, period):
+    out = [LC_MISSING] * len(src)
+    if period <= 0:
+        return out
+    alpha = 2.0 / (period + 1)
+    for i, value in enumerate(src):
+        if lc_is_missing(value):
+            continue
+        if i > 0 and not lc_is_missing(out[i - 1]):
+            out[i] = alpha * value + (1 - alpha) * out[i - 1]
+            continue
+        if i >= period - 1:
+            window = src[i - period + 1:i + 1]
+            if not any(lc_is_missing(v) for v in window):
+                out[i] = sum(window) / period
+    return out
+
+def lc_sma(src, period):
+    out = [LC_MISSING] * len(src)
+    for i in range(len(src)):
+        if i < period - 1:
+            continue
+        window = src[i - period + 1:i + 1]
+        if any(lc_is_missing(v) for v in window):
+            continue
+        out[i] = sum(window) / period
+    return out
+
+def lc_rma(src, period):
+    out = [LC_MISSING] * len(src)
+    alpha = 1.0 / period
+    for i, value in enumerate(src):
+        if lc_is_missing(value):
+            continue
+        if i > 0 and not lc_is_missing(out[i - 1]):
+            out[i] = alpha * value + (1 - alpha) * out[i - 1]
+            continue
+        if i >= period - 1:
+            window = src[i - period + 1:i + 1]
+            if not any(lc_is_missing(v) for v in window):
+                out[i] = sum(window) / period
+    return out
+
+def lc_wilder_smooth(src, period):
+    out = [LC_MISSING] * len(src)
+    for i, value in enumerate(src):
+        if i == 0 or lc_is_missing(out[i - 1]):
+            out[i] = value
+        else:
+            out[i] = out[i - 1] - out[i - 1] / period + value
+    return out
+
+def lc_rescale(src, old_min, old_max, new_min, new_max):
+    return new_min + (new_max - new_min) * (src - old_min) / max(old_max - old_min, 1e-9)
+
+def lc_normalize_running(src, out_min=0.0, out_max=1.0):
+    out = [LC_MISSING] * len(src)
+    hist_min, hist_max = 1e11, -1e11
+    for i, value in enumerate(src):
+        if lc_is_missing(value):
+            continue
+        hist_min = min(hist_min, value)
+        hist_max = max(hist_max, value)
+        out[i] = out_min + (out_max - out_min) * (value - hist_min) / max(hist_max - hist_min, 1e-9)
+    return out
+
+def lc_calc_rsi(src, period):
+    gain = [LC_MISSING] * len(src)
+    loss = [LC_MISSING] * len(src)
+    for i in range(1, len(src)):
+        change = src[i] - src[i - 1]
+        gain[i] = change if change > 0 else 0.0
+        loss[i] = -change if change < 0 else 0.0
+    gain_rma, loss_rma = lc_rma(gain, period), lc_rma(loss, period)
+    out = [LC_MISSING] * len(src)
+    for i in range(len(src)):
+        if lc_is_missing(gain_rma[i]) or lc_is_missing(loss_rma[i]):
+            continue
+        if loss_rma[i] == 0:
+            out[i] = 100.0
+        else:
+            rs = gain_rma[i] / loss_rma[i]
+            out[i] = 100.0 - 100.0 / (1.0 + rs)
+    return out
+
+def lc_calc_normalized_rsi(src, n1, n2):
+    smoothed = lc_ema(lc_calc_rsi(src, n1), n2)
+    return [lc_rescale(v, 0, 100, 0, 1) if not lc_is_missing(v) else LC_MISSING for v in smoothed]
+
+def lc_calc_cci(src, period):
+    avg = lc_sma(src, period)
+    out = [LC_MISSING] * len(src)
+    for i in range(len(src)):
+        if lc_is_missing(avg[i]):
+            continue
+        window = src[i - period + 1:i + 1]
+        mean_dev = sum(abs(v - avg[i]) for v in window) / period
+        out[i] = (src[i] - avg[i]) / (0.015 * mean_dev) if mean_dev != 0 else 0.0
+    return out
+
+def lc_calc_normalized_cci(src, n1, n2):
+    return lc_normalize_running(lc_ema(lc_calc_cci(src, n1), n2))
+
+def lc_calc_wavetrend(hlc3, n1, n2):
+    ema1 = lc_ema(hlc3, n1)
+    abs_dev = [abs(hlc3[i] - ema1[i]) if not lc_is_missing(ema1[i]) else LC_MISSING for i in range(len(hlc3))]
+    ema2 = lc_ema(abs_dev, n1)
+    ci = [LC_MISSING] * len(hlc3)
+    for i in range(len(hlc3)):
+        if lc_is_missing(ema1[i]) or lc_is_missing(ema2[i]):
+            continue
+        ci[i] = (hlc3[i] - ema1[i]) / (0.015 * ema2[i]) if ema2[i] != 0 else 0.0
+    wt1 = lc_ema(ci, n2)
+    wt2 = lc_sma(wt1, 4)
+    raw = [wt1[i] - wt2[i] if not lc_is_missing(wt1[i]) and not lc_is_missing(wt2[i]) else LC_MISSING for i in range(len(hlc3))]
+    return lc_normalize_running(raw)
+
+def lc_calc_adx_normalized(high, low, close, period):
+    tr, dm_plus, dm_minus = [], [], []
+    for i in range(len(close)):
+        prev_close = close[i - 1] if i > 0 else 0.0
+        prev_high = high[i - 1] if i > 0 else 0.0
+        prev_low = low[i - 1] if i > 0 else 0.0
+        tr.append(max(high[i] - low[i], abs(high[i] - prev_close), abs(low[i] - prev_close)))
+        up_move = high[i] - prev_high
+        down_move = prev_low - low[i]
+        dm_plus.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+        dm_minus.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+    tr_s, plus_s, minus_s = lc_wilder_smooth(tr, period), lc_wilder_smooth(dm_plus, period), lc_wilder_smooth(dm_minus, period)
+    dx = []
+    for i in range(len(close)):
+        di_plus = plus_s[i] / tr_s[i] * 100 if tr_s[i] != 0 else 0.0
+        di_minus = minus_s[i] / tr_s[i] * 100 if tr_s[i] != 0 else 0.0
+        dx.append(abs(di_plus - di_minus) / (di_plus + di_minus) * 100 if di_plus + di_minus else 0.0)
+    adx_rma = lc_rma(dx, period)
+    return [lc_rescale(v, 0, 100, 0, 1) if not lc_is_missing(v) else LC_MISSING for v in adx_rma]
+
+def lc_calc_atr(high, low, close, period):
+    tr = []
+    for i in range(len(close)):
+        prev_close = close[i - 1] if i > 0 else 0.0
+        tr.append(max(high[i] - low[i], abs(high[i] - prev_close), abs(low[i] - prev_close)))
+    return lc_rma(tr, period)
+
+def lc_calc_regime_filter(ohlc4, high, low):
+    n = len(ohlc4)
+    abs_slope, ema_abs = [0.0] * n, [0.0] * n
+    if not n:
+        return abs_slope, ema_abs
+    value1, value2, klmf = [0.0] * n, [0.0] * n, [0.0] * n
+    value2[0] = high[0] - low[0]
+    klmf[0] = ohlc4[0]
+    alpha_ema = 2.0 / 201.0
+    for i in range(1, n):
+        value1[i] = 0.2 * (ohlc4[i] - ohlc4[i - 1]) + 0.8 * lc_nz(value1[i - 1])
+        value2[i] = 0.1 * (high[i] - low[i]) + 0.8 * lc_nz(value2[i - 1])
+        omega = abs(value1[i] / value2[i]) if value2[i] != 0 else 0.0
+        alpha = (-(omega ** 2) + math.sqrt(omega ** 4 + 16.0 * omega ** 2)) / 8.0
+        klmf[i] = alpha * ohlc4[i] + (1.0 - alpha) * lc_nz(klmf[i - 1])
+        abs_slope[i] = abs(klmf[i] - klmf[i - 1])
+        prev_ema = lc_nz(ema_abs[i - 1])
+        ema_abs[i] = abs_slope[i] if (prev_ema == 0 and i < 200) else alpha_ema * abs_slope[i] + (1.0 - alpha_ema) * prev_ema
+    return abs_slope, ema_abs
+
+def lc_kernel_rational_quadratic(src, bar_index, lookback, relative_weight, start_at_bar):
+    current_weight, cumulative_weight = 0.0, 0.0
+    denom = max(float(lookback ** 2) * 2.0 * relative_weight, 1e-10)
+    for i in range(min(1 + start_at_bar, bar_index) + 1):
+        weight = (1.0 + (i ** 2 / denom)) ** (-relative_weight)
+        current_weight += src[bar_index - i] * weight
+        cumulative_weight += weight
+    return current_weight / cumulative_weight if cumulative_weight > 0 else src[bar_index]
+
+class LorentzianAnnState:
+    """Faithful port of the real indicator's nearest-neighbor search: log-
+    based Lorentzian distance, skipping every 4th historical bar, keeping a
+    running best-k window with threshold-based eviction — not just a plain
+    top-k sort."""
+    def __init__(self, feature_count=5):
+        self.features = [[] for _ in range(feature_count)]
+        self.labels = []
+        self.distances = []
+        self.predictions = []
+
+    def push(self, values, label):
+        for idx, value in enumerate(values):
+            self.features[idx].append(value)
+        self.labels.append(label)
+
+    def distance(self, idx, values, feature_count):
+        d = 0.0
+        for fidx in range(feature_count):
+            current, historical = values[fidx], self.features[fidx][idx]
+            if lc_is_missing(current) or lc_is_missing(historical):
+                return -math.inf
+            d += math.log(1.0 + abs(current - historical))
+        return d
+
+    def run(self, values, neighbors_count, max_bars_back, feature_count, last_bar_index):
+        if not self.labels:
+            return 0
+        size_loop = min(max_bars_back - 1, len(self.labels) - 1)
+        max_bars_back_index = last_bar_index - max_bars_back if last_bar_index >= max_bars_back else 0
+        last_distance = -1.0
+        for idx in range(max_bars_back_index, size_loop + 1):
+            d = self.distance(idx, values, feature_count)
+            if d >= last_distance and idx % 4 != 0:
+                last_distance = d
+                self.distances.append(d)
+                self.predictions.append(round(self.labels[idx]))
+                if len(self.predictions) > neighbors_count:
+                    threshold_idx = round(neighbors_count * 3.0 / 4.0)
+                    last_distance = self.distances[threshold_idx]
+                    self.distances.pop(0)
+                    self.predictions.pop(0)
+        return int(sum(self.predictions))
+
+async def get_lorentzian_signal(symbol, neighbors_count=8, max_bars_back=2000):
+    """Faithful port of the real 'Machine Learning: Lorentzian Classification'
+    indicator by jdehorty: 5 normalized features (RSI 14, WaveTrend 10/11,
+    CCI 20, ADX 20, RSI 9), the real trailing-comparison label convention,
+    the real every-4th-bar-skipped nearest-neighbor search, plus the real
+    volatility/regime filters and kernel-regression momentum confirmation.
+    Returns 'BUY', 'SELL', or None."""
+    try:
+        klines = await binance_client.get_klines(symbol=symbol, interval=SCAN_KLINE_INTERVAL, limit=300)
+    except Exception as e:
+        logger.warning(f"⚠️ Lorentzian: couldn't fetch klines for {symbol}: {e}")
+        return None
+
+    if len(klines) < 60:
+        return None
+
+    opens = [float(k[1]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    n = len(closes)
+    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(n)]
+    ohlc4 = [(opens[i] + highs[i] + lows[i] + closes[i]) / 4 for i in range(n)]
+
+    f1 = lc_calc_normalized_rsi(closes, 14, 1)
+    f2 = lc_calc_wavetrend(hlc3, 10, 11)
+    f3 = lc_calc_normalized_cci(closes, 20, 1)
+    f4 = lc_calc_adx_normalized(highs, lows, closes, 20)
+    f5 = lc_calc_normalized_rsi(closes, 9, 1)
+    features_by_bar = list(zip(f1, f2, f3, f4, f5))
+
+    ann = LorentzianAnnState(feature_count=5)
+    for i in range(n - 1):  # exclude the last bar — it's the query, not training data
+        train_label = 0
+        if i >= 4:
+            train_label = -1 if closes[i - 4] < closes[i] else 1 if closes[i - 4] > closes[i] else 0
+        ann.push(features_by_bar[i], train_label)
+
+    if len(ann.labels) < neighbors_count:
+        return None
+
+    prediction = ann.run(features_by_bar[-1], neighbors_count, max_bars_back, 5, n - 1)
+
+    atr1, atr10 = lc_calc_atr(highs, lows, closes, 1), lc_calc_atr(highs, lows, closes, 10)
+    filt_vol = atr1[-1] > atr10[-1] if not lc_is_missing(atr1[-1]) and not lc_is_missing(atr10[-1]) else True
+
+    reg_slope, reg_ema_slope = lc_calc_regime_filter(ohlc4, highs, lows)
+    filt_regime = True
+    if reg_ema_slope[-1] != 0:
+        norm_slope = (reg_slope[-1] - reg_ema_slope[-1]) / reg_ema_slope[-1]
+        filt_regime = norm_slope >= -0.1
+
+    yhat1 = [lc_kernel_rational_quadratic(closes, i, 8, 8.0, 25) for i in range(n - 3, n)]
+    is_bullish_rate = yhat1[-2] < yhat1[-1]
+    is_bearish_rate = yhat1[-2] > yhat1[-1]
+
+    if prediction > 0 and filt_vol and filt_regime and is_bullish_rate:
+        return 'BUY'
+    if prediction < 0 and filt_vol and filt_regime and is_bearish_rate:
+        return 'SELL'
+    return None
+
+async def analyze_symbol(symbol):
+    """Runs the actual Trending Strategy indicators on live candles and
+    returns a full diagnostic dict — not just a verdict. Used by both the
+    background scanner and /checknow (so /checknow shows real live numbers,
+    not a canned test)."""
+    try:
+        klines = await binance_client.get_klines(symbol=symbol, interval=SCAN_KLINE_INTERVAL, limit=100)
+    except Exception as e:
+        return {"symbol": symbol, "error": str(e)}
+
+    if len(klines) < 60:
+        return {"symbol": symbol, "error": "not enough candle history yet"}
+
+    opens = [float(k[1]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    last_price = closes[-1]
+
+    sma7 = sma_series(closes, 7)
+    ema45 = ema_series(closes, 45)
+    macd_line, signal_line, histogram = compute_macd(closes, fast=8, slow=12, signal=9)
+
+    if not sma7 or not ema45 or not macd_line:
+        return {"symbol": symbol, "error": "indicators could not be computed"}
+
+    last_sma7 = sma7[-1]
+    last_ema45 = ema45[-1]
+    last_macd = macd_line[-1]
+
+    last_directions = ['up' if c > o else 'down' if c < o else 'flat' for o, c in zip(opens[-4:], closes[-4:])]
+    all_up = all(d == 'up' for d in last_directions)
+    all_down = all(d == 'down' for d in last_directions)
+    trend = "up" if all_up else "down" if all_down else "mixed (ranging)"
+
+    base_verdict = None
+    if all_up and last_price > last_sma7 and last_price > last_ema45 and last_macd > 0:
+        base_verdict = 'BUY'
+    elif all_down and last_price < last_sma7 and last_price < last_ema45 and last_macd < 0:
+        base_verdict = 'SELL'
+
+    # Require the Lorentzian classifier to AGREE before counting as a real
+    # verdict — this raises the bar (fewer, higher-conviction signals)
+    # rather than replacing the already-tested Trending Strategy logic.
+    verdict = None
+    lorentzian_verdict = None
+    if base_verdict:
+        lorentzian_verdict = await get_lorentzian_signal(symbol)
+        if lorentzian_verdict == base_verdict:
+            verdict = base_verdict
+
+    return {
+        "symbol": symbol,
+        "price": last_price,
+        "sma7": last_sma7,
+        "ema45": last_ema45,
+        "macd": last_macd,
+        "trend": trend,
+        "base_verdict": base_verdict,
+        "lorentzian_verdict": lorentzian_verdict,
+        "verdict": verdict,
+    }
+
+async def detect_opportunity(symbol):
+    """Runs the actual Trending Strategy indicators on live candles:
+    MACD(8,12,9), SMA(7) 'green line', EMA(45) 'yellow line', plus the
+    same trend-vs-range read (consecutive candle colors). All four have
+    to agree before this counts as an opportunity. Still NOT a guarantee —
+    same honesty as the strategy write-up itself."""
+    result = await analyze_symbol(symbol)
+    if "error" in result:
+        if "history" not in result["error"]:
+            logger.warning(f"⚠️ Scan: couldn't analyze {symbol}: {result['error']}")
+        return None
+    return result["verdict"]
+
+async def notify_opportunity(bot, symbol, direction):
+    label = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
+    trend_word = "up" if direction == "BUY" else "down"
+    position_word = "above" if direction == "BUY" else "below"
+    for user_id in list(alerts_opted_in):
+        if not get_user_binance_keys(user_id):
+            continue  # not connected — nothing they could do with this alert
+        try:
+            await bot.send_message(
+                user_id,
+                f"🚨 *Opportunity Spotted!*\n\n"
+                f"*{symbol}* is showing a possible *{label}* setup right now, "
+                f"using your Trending Strategy indicators:\n"
+                f"• Last candles trending {trend_word} 🕯️\n"
+                f"• Price {position_word} SMA(7) and EMA(45) 📏\n"
+                f"• MACD(8,12,9) confirms the direction 📈\n\n"
+                f"This is a pattern match, not a guarantee — want to set up a trade to review?",
+                buttons=[[Button.inline("✅ Yes, let's look", f"opportunity:yes:{symbol}:{direction}".encode()),
+                          Button.inline("🔕 No thanks", b"opportunity:no")]],
+                parse_mode='markdown'
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Could not alert user {user_id}: {e}")
+
+last_position_verdict = {}  # {position_id: last verdict seen} — avoids repeat exit alerts every cycle
+
+async def scan_positions_for_exit_signals(bot):
+    """Checks every open BUY position using the same indicators, and alerts
+    the specific holder when the trend looks like it's reversing — i.e.
+    'you found a good entry, here's a good exit.' Always active for anyone
+    holding a position, regardless of the general alerts opt-in, since this
+    is about money they've already committed, not a new speculative tip."""
+    for user_id_str, positions in list(open_positions.items()):
+        user_id = int(user_id_str)
+        for p in list(positions):
+            try:
+                result = await analyze_symbol(p["symbol"])
+            except Exception as e:
+                logger.warning(f"⚠️ Exit scan error for {p['symbol']}: {e}")
+                continue
+            if "error" in result:
+                continue
+
+            verdict = result["verdict"]
+            previous = last_position_verdict.get(p["id"])
+
+            if verdict == "SELL" and previous != "SELL":
+                current_price = result["price"]
+                change_pct = ((current_price - p["entry_price"]) / p["entry_price"]) * 100
+                move_emoji = "🟢" if current_price >= p["entry_price"] else "🔴"
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🎯 *Possible Time to Sell!*\n\n"
+                        f"*{p['symbol']}* trend looks like it's reversing — MACD(8,12,9), "
+                        f"SMA(7) and EMA(45) now agree on SELL.\n\n"
+                        f"{move_emoji} Entry: ${p['entry_price']:,.4f} | Now: ${current_price:,.4f} "
+                        f"({change_pct:+.2f}%)\n\n"
+                        f"Want to close this position now?",
+                        buttons=[[Button.inline("💰 Close Position", f"position:close:{p['id']}".encode()),
+                                  Button.inline("🤝 Keep Holding", b"position:keep")]],
+                        parse_mode='markdown'
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not send exit alert to {user_id}: {e}")
+
+            last_position_verdict[p["id"]] = verdict
+
+async def scan_for_opportunities(bot):
+    """Background loop — checks the watchlist every SCAN_INTERVAL_MINUTES
+    and notifies opted-in users on new setups only (not every cycle).
+    Also checks everyone's open positions for exit signals each cycle."""
+    while True:
+        await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+        if not binance_client:
+            continue
+        for symbol in SCAN_SYMBOLS:
+            try:
+                direction = await detect_opportunity(symbol)
+            except Exception as e:
+                logger.warning(f"⚠️ Scan error for {symbol}: {e}")
+                continue
+            previous = last_opportunity_direction.get(symbol)
+            if direction and direction != previous:
+                last_opportunity_direction[symbol] = direction
+                if alerts_opted_in:
+                    await notify_opportunity(bot, symbol, direction)
+            elif not direction:
+                last_opportunity_direction[symbol] = None
+
+        await scan_positions_for_exit_signals(bot)
+
+async def send_alerts_status(bot, chat, user_id):
+    is_on = user_id in alerts_opted_in
+    status = "🔔 ON" if is_on else "🔕 OFF"
+    await bot.send_message(
+        chat,
+        f"📡 *Opportunity Alerts* — currently {status}\n\n"
+        f"When ON, I scan {', '.join(SCAN_SYMBOLS)} every ~{int(SCAN_INTERVAL_MINUTES)} min "
+        f"using your Trending Strategy indicators (MACD 8/12/9, SMA(7), EMA(45), plus the "
+        f"trend-vs-range read). If they all agree, I'll message you here — you still "
+        f"review and confirm everything manually, nothing trades automatically.\n\n"
+        f"Requires a connected Binance account (/connectbinance) to receive alerts.",
+        buttons=[[Button.inline("🔔 Turn On", b"alerts:on"), Button.inline("🔕 Turn Off", b"alerts:off")],
+                 [Button.inline("🏠 Main Menu", b"menu:main")]],
+        parse_mode='markdown'
+    )
+
+def setup_opportunity_alerts_handlers(bot):
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/checknow$'))
+    async def checknow_command(event):
+        if not binance_client:
+            await event.respond("📊 Live data isn't set up yet — the bot owner needs to install python-binance. 🔧")
+            return
+        status_msg = await event.respond(f"🔄 Checking {', '.join(SCAN_SYMBOLS)} right now...")
+        lines = []
+        for symbol in SCAN_SYMBOLS:
+            result = await analyze_symbol(symbol)
+            if "error" in result:
+                lines.append(f"⚠️ *{symbol}*: {result['error']}")
+                continue
+            verdict = result["verdict"]
+            base = result.get("base_verdict")
+            lor = result.get("lorentzian_verdict")
+            verdict_label = "🟢 BUY setup" if verdict == "BUY" else "🔴 SELL setup" if verdict == "SELL" else "— no setup right now"
+            agreement_note = ""
+            if base and not verdict:
+                agreement_note = f"\n  ⚖️ Trend indicators say {base}, but Lorentzian layer says {lor or 'no signal'} — need both to agree"
+            lines.append(
+                f"*{symbol}* — {verdict_label}\n"
+                f"  Price: ${result['price']:,.4f} | Trend: {result['trend']}\n"
+                f"  SMA(7): ${result['sma7']:,.4f} | EMA(45): ${result['ema45']:,.4f}\n"
+                f"  MACD(8,12,9): {result['macd']:+.4f}"
+                f"{agreement_note}"
+            )
+        await status_msg.edit(
+            "📊 *Live Check* — real data, right now:\n\n" + "\n\n".join(lines),
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/alerts$'))
+    async def alerts_status_command(event):
+        chat = await event.get_chat()
+        await send_alerts_status(bot, chat, event.sender_id)
+
+    @bot.on(events.CallbackQuery(data=b"menu:alerts"))
+    async def alerts_status_menu(event):
+        await event.answer()
+        chat = await event.get_chat()
+        await send_alerts_status(bot, chat, event.sender_id)
+
+    @bot.on(events.CallbackQuery(data=b"alerts:on"))
+    async def alerts_on_callback(event):
+        alerts_opted_in.add(event.sender_id)
+        _save_opt_in_set(alerts_opted_in)
+        await event.edit("🔔 *Opportunity alerts turned ON* — I'll message you here if I spot a setup.", buttons=None, parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(data=b"alerts:off"))
+    async def alerts_off_callback(event):
+        alerts_opted_in.discard(event.sender_id)
+        _save_opt_in_set(alerts_opted_in)
+        await event.edit("🔕 *Opportunity alerts turned OFF.*", buttons=None, parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^opportunity:yes:([^:]+):(BUY|SELL)$"))
+    async def opportunity_yes_callback(event):
+        symbol = event.pattern_match.group(1).decode()
+        side = event.pattern_match.group(2).decode()
+        if not await get_user_binance_client(event.sender_id):
+            await event.edit("You haven't connected a Binance account. Use /connectbinance first. 🔐", buttons=None)
+            return
+        trade_flow_state[event.sender_id] = {"step": "awaiting_quantity", "symbol": symbol, "side": side}
+        await event.edit(
+            f"📊 *{symbol}* — *{side}*\n\nHow much? Type the quantity, e.g. `0.001`",
+            buttons=None,
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"opportunity:no"))
+    async def opportunity_no_callback(event):
+        await event.edit("👍 No problem — I'll keep scanning.", buttons=None)
+
+    logger.info(f"✅ Opportunity scanner handlers registered (watching {', '.join(SCAN_SYMBOLS)} every {SCAN_INTERVAL_MINUTES}min)")
 
 async def get_min_notional(symbol):
     """Looks up the minimum order value (price × quantity) Binance requires
@@ -1127,7 +1780,54 @@ async def get_min_notional(symbol):
         logger.warning(f"⚠️ Could not fetch min notional for {symbol}: {e}")
     return None
 
-async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity):
+def get_quote_asset(symbol):
+    """Best-effort guess at the quote asset from the symbol name, so we
+    know which balance to size risk against."""
+    for quote in ("USDT", "BUSD", "USDC", "FDUSD", "BTC", "ETH"):
+        if symbol.endswith(quote):
+            return quote
+    return "USDT"
+
+async def finalize_risk_sized_trade(event, bot, symbol, side, stop_pct):
+    """Calculates a position size so that if the stop-loss hits, the loss
+    equals ~1% of the user's balance — then shows the same confirmation
+    card as manual entry, with the stop-loss attached."""
+    client = await get_user_binance_client(event.sender_id)
+    if not client:
+        await event.answer("You haven't connected a Binance account.", alert=True)
+        return
+
+    trade_flow_state.pop(event.sender_id, None)
+    quote_asset = get_quote_asset(symbol)
+
+    try:
+        ticker = await binance_client.get_symbol_ticker(symbol=symbol)
+        price = float(ticker['price'])
+        account = await client.get_account()
+    except Exception as e:
+        await event.edit(f"⚠️ Couldn't fetch live price/balance: {e}", buttons=None)
+        return
+
+    balance = 0.0
+    for b in account.get('balances', []):
+        if b['asset'] == quote_asset:
+            balance = float(b['free'])
+            break
+
+    if balance <= 0:
+        await event.edit(f"⚠️ Your {quote_asset} balance is 0 — nothing available to size a trade with.", buttons=None)
+        return
+
+    risk_amount = balance * 0.01
+    stop_distance = price * (stop_pct / 100)
+    quantity = risk_amount / stop_distance
+    stop_loss_price = price * (1 - stop_pct / 100) if side == "BUY" else price * (1 + stop_pct / 100)
+
+    chat = await event.get_chat()
+    await event.delete()
+    await send_trade_confirmation(bot, chat, event.sender_id, symbol, side, quantity, stop_loss_price=stop_loss_price, risk_amount=risk_amount)
+
+async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity, stop_loss_price=None, risk_amount=None):
     """Fetches the live price and shows a Confirm/Cancel proposal card.
     Shared by both the /trade command and the guided button flow — this
     is the single place a pending trade gets created."""
@@ -1157,7 +1857,14 @@ async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity):
         )
         return
 
-    pending_trades[user_id] = {"symbol": symbol, "side": side, "quantity": quantity}
+    pending_trades[user_id] = {"symbol": symbol, "side": side, "quantity": quantity, "stop_loss_price": stop_loss_price}
+
+    stop_note = ""
+    if stop_loss_price is not None:
+        stop_note = (
+            f"• Stop-loss: *${stop_loss_price:,.4f}* (auto-sells if hit)\n"
+            f"• Risking: *${risk_amount:,.2f}* (~1% of balance)\n"
+        )
 
     mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
     await bot.send_message(
@@ -1167,7 +1874,8 @@ async def send_trade_confirmation(bot, chat, user_id, symbol, side, quantity):
         f"• Side: *{side}*\n"
         f"• Quantity: *{quantity}*\n"
         f"• Current price: *${price:,.4f}*\n"
-        f"• Estimated cost: *${estimated_cost:,.2f}*\n\n"
+        f"• Estimated cost: *${estimated_cost:,.2f}*\n"
+        f"{stop_note}\n"
         f"Nothing happens until you confirm. 👇",
         buttons=[[Button.inline("✅ Confirm", b"trade:confirm"),
                   Button.inline("❌ Cancel", b"trade:cancel")]],
@@ -1349,6 +2057,50 @@ def setup_binance_account_handlers(bot):
 
     logger.info("✅ Binance account handlers registered (/connectbinance, /disconnectbinance, /mybinance)")
 
+def get_position(user_id, position_id):
+    positions = open_positions.get(str(user_id), [])
+    for p in positions:
+        if p["id"] == position_id:
+            return p
+    return None
+
+async def send_positions_list(bot, chat, user_id):
+    positions = open_positions.get(str(user_id), [])
+    if not positions:
+        await bot.send_message(chat, "📊 You have no open positions right now.")
+        return
+
+    for p in positions:
+        try:
+            ticker = await binance_client.get_symbol_ticker(symbol=p["symbol"])
+            current_price = float(ticker['price'])
+            is_up = current_price >= p["entry_price"]
+            move_emoji = "🟢" if is_up else "🔴"
+            change_pct = ((current_price - p["entry_price"]) / p["entry_price"]) * 100
+            await bot.send_message(
+                chat,
+                f"{move_emoji} *{p['symbol']}*\n"
+                f"Entry: ${p['entry_price']:,.4f} | Now: ${current_price:,.4f} ({change_pct:+.2f}%)",
+                buttons=[[Button.inline("🔄 Refresh", f"position:status:{p['id']}".encode())],
+                         [Button.inline("💰 Close Position", f"position:close:{p['id']}".encode())]],
+                parse_mode='markdown'
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Could not fetch live price for position {p['id']}: {e}")
+
+def trade_sizing_buttons(symbol, side):
+    return [
+        [Button.inline("✏️ Type exact quantity", f"trade:sizing:{symbol}:{side}:manual".encode())],
+        [Button.inline("🎯 Auto-size (1% risk)", f"trade:sizing:{symbol}:{side}:risk".encode())],
+        [Button.inline("🏠 Main Menu", b"menu:main")]
+    ]
+
+def stop_pct_buttons(symbol, side):
+    rows = [[Button.inline(f"{p}%", f"trade:stoppct:{symbol}:{side}:{p}".encode()) for p in [1, 2, 3, 5]]]
+    rows.append([Button.inline("✏️ Type a custom %", f"trade:stoppct:{symbol}:{side}:custom".encode())])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
 def setup_binance_trading_handler(bot):
     """Registers the /trade command, the guided button flow, the
     Confirm/Cancel callbacks, and /balance for checking your account.
@@ -1464,12 +2216,56 @@ def setup_binance_trading_handler(bot):
     async def trade_side_callback(event):
         symbol = event.pattern_match.group(1).decode()
         side = event.pattern_match.group(2).decode()
-        trade_flow_state[event.sender_id] = {"step": "awaiting_quantity", "symbol": symbol, "side": side}
+        if side == "SELL":
+            # Selling only makes sense as "how much am I closing" — risk
+            # sizing is for opening new exposure (BUY), so go straight to
+            # manual quantity entry, same as before.
+            trade_flow_state[event.sender_id] = {"step": "awaiting_quantity", "symbol": symbol, "side": side}
+            await event.edit(
+                f"📊 *{symbol}* — *{side}*\n\nHow much? Type the quantity, e.g. `0.001`",
+                buttons=None,
+                parse_mode='markdown'
+            )
+            return
+        trade_flow_state[event.sender_id] = {"step": "awaiting_sizing_choice", "symbol": symbol, "side": side}
         await event.edit(
-            f"📊 *{symbol}* — *{side}*\n\nHow much? Type the quantity, e.g. `0.001`",
-            buttons=None,
+            f"📊 *{symbol}* — *{side}*\n\nHow do you want to size this trade?",
+            buttons=trade_sizing_buttons(symbol, side),
             parse_mode='markdown'
         )
+
+    @bot.on(events.CallbackQuery(pattern=rb"^trade:sizing:([^:]+):(BUY|SELL):(manual|risk)$"))
+    async def trade_sizing_callback(event):
+        symbol = event.pattern_match.group(1).decode()
+        side = event.pattern_match.group(2).decode()
+        method = event.pattern_match.group(3).decode()
+        if method == "manual":
+            trade_flow_state[event.sender_id] = {"step": "awaiting_quantity", "symbol": symbol, "side": side}
+            await event.edit(
+                f"📊 *{symbol}* — *{side}*\n\nHow much? Type the quantity, e.g. `0.001`",
+                buttons=None,
+                parse_mode='markdown'
+            )
+        else:
+            trade_flow_state[event.sender_id] = {"step": "awaiting_stop_pct_choice", "symbol": symbol, "side": side}
+            await event.edit(
+                f"📊 *{symbol}* — *{side}*\n\n"
+                f"Pick your stop-loss % — this protects you (auto-sells if price drops "
+                f"this much) AND sizes your position so a stop-out only costs *1% of your balance*.",
+                buttons=stop_pct_buttons(symbol, side),
+                parse_mode='markdown'
+            )
+
+    @bot.on(events.CallbackQuery(pattern=rb"^trade:stoppct:([^:]+):(BUY|SELL):(custom|\d+)$"))
+    async def trade_stop_pct_callback(event):
+        symbol = event.pattern_match.group(1).decode()
+        side = event.pattern_match.group(2).decode()
+        choice = event.pattern_match.group(3).decode()
+        if choice == "custom":
+            trade_flow_state[event.sender_id] = {"step": "awaiting_stop_pct_text", "symbol": symbol, "side": side}
+            await event.edit("✏️ Type your stop-loss percentage, e.g. `2.5`:", buttons=None, parse_mode='markdown')
+            return
+        await finalize_risk_sized_trade(event, bot, symbol, side, float(choice))
 
     @bot.on(events.CallbackQuery(data=b"trade:confirm"))
     async def trade_confirm_callback(event):
@@ -1491,13 +2287,26 @@ def setup_binance_trading_handler(bot):
                 type="MARKET",
                 quantity=trade["quantity"],
             )
+
+            executed_qty = float(order.get('executedQty', 0) or 0)
+            quote_qty = float(order.get('cummulativeQuoteQty', 0) or 0)
+            fill_price = (quote_qty / executed_qty) if executed_qty > 0 else None
+
+            buttons = None
+            extra_note = ""
+            if trade["side"] == "BUY" and fill_price:
+                position_id = add_open_position(event.sender_id, trade["symbol"], trade["quantity"], fill_price, order.get('orderId'), trade.get("stop_loss_price"))
+                extra_note = "\n\n📊 I'll track this position — check its live status anytime."
+                buttons = [[Button.inline("📊 Check Status", f"position:status:{position_id}".encode())]]
+
             await event.edit(
                 f"✅ *Order placed!*\n\n"
                 f"• Symbol: {trade['symbol']}\n"
                 f"• Side: {trade['side']}\n"
                 f"• Quantity: {trade['quantity']}\n"
-                f"• Order ID: `{order.get('orderId', 'n/a')}`",
-                buttons=None,
+                f"• Order ID: `{order.get('orderId', 'n/a')}`"
+                f"{extra_note}",
+                buttons=buttons,
                 parse_mode='markdown'
             )
         except BinanceAPIException as e:
@@ -1512,6 +2321,92 @@ def setup_binance_trading_handler(bot):
         trade_flow_state.pop(event.sender_id, None)
         await event.edit("🚫 Trade cancelled — nothing was placed.", buttons=None)
         await event.answer("Cancelled")
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/positions$'))
+    async def positions_command(event):
+        await send_positions_list(bot, await event.get_chat(), event.sender_id)
+
+    @bot.on(events.CallbackQuery(pattern=rb"^position:status:(.+)$"))
+    async def position_status_callback(event):
+        position_id = event.pattern_match.group(1).decode()
+        position = get_position(event.sender_id, position_id)
+        if not position:
+            await event.answer("Position not found — it may have been closed already.", alert=True)
+            return
+
+        try:
+            ticker = await binance_client.get_symbol_ticker(symbol=position["symbol"])
+            current_price = float(ticker['price'])
+        except Exception as e:
+            await event.answer(f"Couldn't fetch live price: {e}", alert=True)
+            return
+
+        is_up = current_price >= position["entry_price"]
+        move_emoji = "🟢" if is_up else "🔴"
+        change_pct = ((current_price - position["entry_price"]) / position["entry_price"]) * 100
+
+        await event.answer()
+        await event.edit(
+            f"{move_emoji} *{position['symbol']} — Live Status*\n\n"
+            f"• Entry price: ${position['entry_price']:,.4f}\n"
+            f"• Current price: ${current_price:,.4f}\n"
+            f"• Movement: {move_emoji} {change_pct:+.2f}%\n"
+            f"• Quantity: {position['quantity']}",
+            buttons=[[Button.inline("🔄 Refresh", f"position:status:{position_id}".encode())],
+                     [Button.inline("💰 Close Position", f"position:close:{position_id}".encode())]],
+            parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(data=b"position:keep"))
+    async def position_keep_callback(event):
+        await event.edit("🤝 Got it, keeping it open — I'll keep watching and let you know if anything changes.", buttons=None)
+
+    @bot.on(events.CallbackQuery(pattern=rb"^position:close:(.+)$"))
+    async def position_close_callback(event):
+        position_id = event.pattern_match.group(1).decode()
+        position = get_position(event.sender_id, position_id)
+        if not position:
+            await event.answer("Position not found — it may have been closed already.", alert=True)
+            return
+
+        client = await get_user_binance_client(event.sender_id)
+        if not client:
+            await event.answer("You haven't connected a Binance account.", alert=True)
+            return
+
+        await event.answer("Closing position...")
+        try:
+            order = await client.create_order(
+                symbol=position["symbol"],
+                side="SELL",
+                type="MARKET",
+                quantity=position["quantity"],
+            )
+            executed_qty = float(order.get('executedQty', 0) or 0)
+            quote_qty = float(order.get('cummulativeQuoteQty', 0) or 0)
+            exit_price = (quote_qty / executed_qty) if executed_qty > 0 else None
+
+            remove_open_position(event.sender_id, position_id)
+
+            if exit_price is not None:
+                won = exit_price > position["entry_price"]
+                result_label = "Win ✅️🤑" if won else "Lost ❎️🥱"
+                change_pct = ((exit_price - position["entry_price"]) / position["entry_price"]) * 100
+                await event.edit(
+                    f"*{position['symbol']} — Position Closed*\n\n"
+                    f"• Entry: ${position['entry_price']:,.4f}\n"
+                    f"• Exit: ${exit_price:,.4f}\n"
+                    f"• Result: *{result_label}* ({change_pct:+.2f}%)",
+                    buttons=None,
+                    parse_mode='markdown'
+                )
+            else:
+                await event.edit(f"✅ Position closed — Order ID `{order.get('orderId', 'n/a')}`", buttons=None, parse_mode='markdown')
+        except BinanceAPIException as e:
+            await event.answer(f"Close failed: {e.message}", alert=True)
+        except Exception as e:
+            logger.error(f"❌ Position close error: {e}")
+            await event.answer("Something went wrong closing that position.", alert=True)
 
     logger.info("✅ Binance trading handler registered (/trade command + guided button flow)")
 
@@ -1674,6 +2569,7 @@ async def run_bot():
     await init_binance_client()
     setup_binance_account_handlers(bot)
     setup_binance_trading_handler(bot)
+    setup_opportunity_alerts_handlers(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
@@ -1825,6 +2721,7 @@ async def run_bot():
 
     logger.info("🤖 Rex Signal Bot LIVE!")
     asyncio.create_task(keepalive(userbot))
+    asyncio.create_task(scan_for_opportunities(bot))
     await userbot.run_until_disconnected()
     return True
 
