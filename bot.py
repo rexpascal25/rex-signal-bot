@@ -1666,30 +1666,32 @@ async def scan_positions_for_exit_signals(bot):
 async def scan_for_opportunities(bot):
     """Background loop — checks the watchlist every SCAN_INTERVAL_MINUTES
     and notifies opted-in users on new setups only (not every cycle).
-    Also checks everyone's open positions for exit signals each cycle."""
+    Also checks everyone's open positions for exit signals each cycle.
+    Runs an immediate check on startup (not just after the first sleep),
+    so a redeploy doesn't cost a full wasted interval before anything runs."""
     while True:
-        await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
-        if not binance_client:
-            continue
-        for symbol in SCAN_SYMBOLS:
-            try:
-                direction = await detect_opportunity(symbol)
-            except Exception as e:
-                logger.warning(f"⚠️ Scan error for {symbol}: {e}")
-                continue
-            previous = last_opportunity_direction.get(symbol)
-            if direction and direction != previous:
-                last_opportunity_direction[symbol] = direction
-                if alerts_opted_in:
-                    await notify_opportunity(bot, symbol, direction)
-                if direction == "BUY":
-                    for user_id_str, session in list(autotrade_sessions.items()):
-                        if session.get("enabled"):
-                            await execute_autotrade(bot, int(user_id_str), symbol, direction)
-            elif not direction:
-                last_opportunity_direction[symbol] = None
+        if binance_client:
+            for symbol in SCAN_SYMBOLS:
+                try:
+                    direction = await detect_opportunity(symbol)
+                except Exception as e:
+                    logger.warning(f"⚠️ Scan error for {symbol}: {e}")
+                    continue
+                previous = last_opportunity_direction.get(symbol)
+                if direction and direction != previous:
+                    last_opportunity_direction[symbol] = direction
+                    if alerts_opted_in:
+                        await notify_opportunity(bot, symbol, direction)
+                    if direction == "BUY":
+                        for user_id_str, session in list(autotrade_sessions.items()):
+                            if session.get("enabled"):
+                                await execute_autotrade(bot, int(user_id_str), symbol, direction)
+                elif not direction:
+                    last_opportunity_direction[symbol] = None
 
-        await scan_positions_for_exit_signals(bot)
+            await scan_positions_for_exit_signals(bot)
+
+        await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 async def send_alerts_status(bot, chat, user_id):
     is_on = user_id in alerts_opted_in
