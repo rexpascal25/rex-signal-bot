@@ -513,6 +513,7 @@ def main_menu_buttons():
         [Button.inline("🟡 Trade on Binance", b"menu:trade")],
         [Button.inline("🔔 Opportunity Alerts", b"menu:alerts")],
         [Button.inline("🤖 Auto-Trading", b"menu:autotrade")],
+        [Button.inline("⚡ Futures Trading", b"menu:futures")],
     ]
 
 def strategy_list_buttons():
@@ -1187,6 +1188,7 @@ def _save_opt_in_set(id_set):
 
 alerts_opted_in = _load_opt_in_set()
 last_opportunity_direction = {}  # {symbol: "BUY"/"SELL"/None} — avoids re-alerting every cycle
+last_opportunity_direction_futures = {}  # separate tracking — futures signals are independent of spot
 
 def ema_series(values, period):
     """Exponential moving average, seeded with a simple average of the
@@ -1508,6 +1510,127 @@ async def get_lorentzian_signal(symbol, neighbors_count=8, max_bars_back=2000):
         return 'SELL'
     return None
 
+# ── Futures variants — identical math, futures candle data instead of spot ──
+async def get_lorentzian_signal_futures(symbol, neighbors_count=8, max_bars_back=2000):
+    """Same faithful Lorentzian Classification as get_lorentzian_signal, but
+    reading Binance FUTURES candles instead of spot (futures prices differ
+    slightly from spot due to funding-rate basis, so this reads its own
+    data rather than assuming spot candles are close enough)."""
+    try:
+        klines = await binance_client.futures_klines(symbol=symbol, interval=SCAN_KLINE_INTERVAL, limit=300)
+    except Exception as e:
+        logger.warning(f"⚠️ Lorentzian (futures): couldn't fetch klines for {symbol}: {e}")
+        return None
+
+    if len(klines) < 60:
+        return None
+
+    opens = [float(k[1]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    n = len(closes)
+    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(n)]
+    ohlc4 = [(opens[i] + highs[i] + lows[i] + closes[i]) / 4 for i in range(n)]
+
+    f1 = lc_calc_normalized_rsi(closes, 14, 1)
+    f2 = lc_calc_wavetrend(hlc3, 10, 11)
+    f3 = lc_calc_normalized_cci(closes, 20, 1)
+    f4 = lc_calc_adx_normalized(highs, lows, closes, 20)
+    f5 = lc_calc_normalized_rsi(closes, 9, 1)
+    features_by_bar = list(zip(f1, f2, f3, f4, f5))
+
+    ann = LorentzianAnnState(feature_count=5)
+    for i in range(n - 1):
+        train_label = 0
+        if i >= 4:
+            train_label = -1 if closes[i - 4] < closes[i] else 1 if closes[i - 4] > closes[i] else 0
+        ann.push(features_by_bar[i], train_label)
+
+    if len(ann.labels) < neighbors_count:
+        return None
+
+    prediction = ann.run(features_by_bar[-1], neighbors_count, max_bars_back, 5, n - 1)
+
+    atr1, atr10 = lc_calc_atr(highs, lows, closes, 1), lc_calc_atr(highs, lows, closes, 10)
+    filt_vol = atr1[-1] > atr10[-1] if not lc_is_missing(atr1[-1]) and not lc_is_missing(atr10[-1]) else True
+
+    reg_slope, reg_ema_slope = lc_calc_regime_filter(ohlc4, highs, lows)
+    filt_regime = True
+    if reg_ema_slope[-1] != 0:
+        norm_slope = (reg_slope[-1] - reg_ema_slope[-1]) / reg_ema_slope[-1]
+        filt_regime = norm_slope >= -0.1
+
+    yhat1 = [lc_kernel_rational_quadratic(closes, i, 8, 8.0, 25) for i in range(n - 3, n)]
+    is_bullish_rate = yhat1[-2] < yhat1[-1]
+    is_bearish_rate = yhat1[-2] > yhat1[-1]
+
+    if prediction > 0 and filt_vol and filt_regime and is_bullish_rate:
+        return 'BUY'
+    if prediction < 0 and filt_vol and filt_regime and is_bearish_rate:
+        return 'SELL'
+    return None
+
+async def analyze_symbol_futures(symbol):
+    """Same diagnostic analysis as analyze_symbol, reading futures candles.
+    On futures, BOTH BUY (long) and SELL (short) verdicts are genuinely
+    actionable, unlike spot where a bare SELL has nothing to act on."""
+    try:
+        klines = await binance_client.futures_klines(symbol=symbol, interval=SCAN_KLINE_INTERVAL, limit=100)
+    except Exception as e:
+        return {"symbol": symbol, "error": str(e)}
+
+    if len(klines) < 60:
+        return {"symbol": symbol, "error": "not enough candle history yet"}
+
+    opens = [float(k[1]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    last_price = closes[-1]
+
+    sma7 = sma_series(closes, 7)
+    ema45 = ema_series(closes, 45)
+    macd_line, signal_line, histogram = compute_macd(closes, fast=8, slow=12, signal=9)
+
+    if not sma7 or not ema45 or not macd_line:
+        return {"symbol": symbol, "error": "indicators could not be computed"}
+
+    last_sma7 = sma7[-1]
+    last_ema45 = ema45[-1]
+    last_macd = macd_line[-1]
+
+    last_directions = ['up' if c > o else 'down' if c < o else 'flat' for o, c in zip(opens[-4:], closes[-4:])]
+    up_count = sum(1 for d in last_directions if d == 'up')
+    down_count = sum(1 for d in last_directions if d == 'down')
+    all_up = up_count >= 3
+    all_down = down_count >= 3
+    trend = "up" if all_up else "down" if all_down else "mixed (ranging)"
+
+    base_verdict = None
+    if all_up and last_price > last_sma7 and last_price > last_ema45 and last_macd > 0:
+        base_verdict = 'BUY'
+    elif all_down and last_price < last_sma7 and last_price < last_ema45 and last_macd < 0:
+        base_verdict = 'SELL'
+
+    verdict = None
+    lorentzian_verdict = None
+    if base_verdict:
+        lorentzian_verdict = await get_lorentzian_signal_futures(symbol)
+        opposite = 'SELL' if base_verdict == 'BUY' else 'BUY'
+        if lorentzian_verdict != opposite:
+            verdict = base_verdict
+
+    return {
+        "symbol": symbol,
+        "price": last_price,
+        "sma7": last_sma7,
+        "ema45": last_ema45,
+        "macd": last_macd,
+        "trend": trend,
+        "base_verdict": base_verdict,
+        "lorentzian_verdict": lorentzian_verdict,
+        "verdict": verdict,
+    }
+
 async def analyze_symbol(symbol):
     """Runs the actual Trending Strategy indicators on live candles and
     returns a full diagnostic dict — not just a verdict. Used by both the
@@ -1586,6 +1709,17 @@ async def detect_opportunity(symbol):
     if "error" in result:
         if "history" not in result["error"]:
             logger.warning(f"⚠️ Scan: couldn't analyze {symbol}: {result['error']}")
+        return None
+    return result["verdict"]
+
+async def detect_opportunity_futures(symbol):
+    """Same as detect_opportunity, but reads futures candles — futures and
+    spot prices differ slightly (funding-rate basis), so futures trading
+    decisions should be based on futures data, not spot."""
+    result = await analyze_symbol_futures(symbol)
+    if "error" in result:
+        if "history" not in result["error"]:
+            logger.warning(f"⚠️ Scan (futures): couldn't analyze {symbol}: {result['error']}")
         return None
     return result["verdict"]
 
@@ -1688,6 +1822,21 @@ async def scan_for_opportunities(bot):
                                 await execute_autotrade(bot, int(user_id_str), symbol, direction)
                 elif not direction:
                     last_opportunity_direction[symbol] = None
+
+                if futures_sessions:
+                    try:
+                        futures_direction = await detect_opportunity_futures(symbol)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Futures scan error for {symbol}: {e}")
+                        futures_direction = None
+                    previous_futures = last_opportunity_direction_futures.get(symbol)
+                    if futures_direction and futures_direction != previous_futures:
+                        last_opportunity_direction_futures[symbol] = futures_direction
+                        for user_id_str, fsession in list(futures_sessions.items()):
+                            if fsession.get("enabled"):
+                                await execute_futures_autotrade(bot, int(user_id_str), symbol, futures_direction)
+                    elif not futures_direction:
+                        last_opportunity_direction_futures[symbol] = None
 
             await scan_positions_for_exit_signals(bot)
 
@@ -2935,6 +3084,8 @@ def setup_agent_handler(bot):
             return
         if await handle_autotrade_setup_text(event, bot):
             return
+        if await handle_futures_setup_text(event, bot):
+            return
 
         if not gemini_model:
             await event.respond(
@@ -2968,6 +3119,557 @@ def setup_agent_handler(bot):
             await event.respond(reply_text[i:i + 3900])
 
     logger.info("✅ Market Analyst agent handler registered")
+
+# ══════════════════════════════════════════════════════════════
+# NEW: Futures Auto-Trading (leverage, both long AND short)
+# ══════════════════════════════════════════════════════════════
+#
+# Same strategy, same math, same safety philosophy as spot auto-trading —
+# but futures lets a SELL signal actually be acted on (shorting), and adds
+# leverage, which changes the risk math. This section is deliberately kept
+# separate from the spot code so nothing here can affect what's already
+# working.
+#
+# Setup requirements:
+#   • Binance Futures Testnet is a SEPARATE system from Spot Testnet —
+#     generate keys at testnet.binancefuture.com, not testnet.binance.vision
+#   • On live Binance, the same API key can work for both spot and futures,
+#     as long as "Futures" permission is enabled on the key AND the Futures
+#     wallet has funds transferred into it (separate from the Spot wallet)
+#   • Margin type is always ISOLATED here — never cross — so a bad trade's
+#     risk is capped to that position's own margin, never your whole balance
+
+FUTURES_SESSIONS_FILE = os.path.join(DATA_DIR, 'futures_sessions.json')
+LEVERAGE_MAX_ALLOWED = int(os.environ.get('LEVERAGE_MAX_ALLOWED', '10'))  # hard safety ceiling
+
+def _load_futures_sessions():
+    if not os.path.exists(FUTURES_SESSIONS_FILE):
+        return {}
+    try:
+        with open(FUTURES_SESSIONS_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not read futures sessions file: {e}")
+        return {}
+
+def _save_futures_sessions(store):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(FUTURES_SESSIONS_FILE, 'w') as f:
+        json.dump(store, f)
+
+futures_sessions = _load_futures_sessions()
+futures_setup_state = {}
+FUTURES_POSITIONS_FILE = os.path.join(DATA_DIR, 'futures_positions.json')
+
+def _load_futures_positions():
+    if not os.path.exists(FUTURES_POSITIONS_FILE):
+        return {}
+    try:
+        with open(FUTURES_POSITIONS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_futures_positions(store):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(FUTURES_POSITIONS_FILE, 'w') as f:
+        json.dump(store, f)
+
+futures_positions = _load_futures_positions()
+
+def get_futures_session(user_id):
+    return futures_sessions.get(str(user_id))
+
+def save_futures_session(user_id, session):
+    futures_sessions[str(user_id)] = session
+    _save_futures_sessions(futures_sessions)
+
+def stop_futures_session(user_id):
+    session = futures_sessions.get(str(user_id))
+    if session:
+        session["enabled"] = False
+        _save_futures_sessions(futures_sessions)
+
+def add_futures_position(user_id, symbol, side, quantity, entry_price, order_id, stop_loss_price, liquidation_price, leverage):
+    key = str(user_id)
+    positions = futures_positions.setdefault(key, [])
+    position_id = f"{order_id}"
+    positions.append({
+        "id": position_id, "symbol": symbol, "side": side, "quantity": quantity,
+        "entry_price": entry_price, "stop_loss_price": stop_loss_price,
+        "liquidation_price": liquidation_price, "leverage": leverage
+    })
+    _save_futures_positions(futures_positions)
+    return position_id
+
+def remove_futures_position(user_id, position_id):
+    key = str(user_id)
+    positions = futures_positions.get(key, [])
+    futures_positions[key] = [p for p in positions if p["id"] != position_id]
+    _save_futures_positions(futures_positions)
+
+async def execute_futures_autotrade(bot, user_id, symbol, direction):
+    """Opens a leveraged long (BUY) or short (SELL) position — the one
+    real advantage futures has over spot for this bot. Every position still
+    gets its own % stop-loss AND is monitored against Binance's own real
+    liquidation price as a second, independent safety check."""
+    session = get_futures_session(user_id)
+    if not session or not session.get("enabled"):
+        logger.info(f"ℹ️ Futures auto-trade skip [{symbol}, user {user_id}]: no active session")
+        return
+    if symbol not in session.get("symbols", []):
+        logger.info(f"ℹ️ Futures auto-trade skip [{symbol}, user {user_id}]: symbol not in session watchlist")
+        return
+    if session["trades_done"] >= session["max_trades"]:
+        logger.info(f"ℹ️ Futures auto-trade skip [{symbol}, user {user_id}]: max trades reached")
+        return
+    existing = [p for p in futures_positions.get(str(user_id), []) if p["symbol"] == symbol]
+    if existing:
+        logger.info(f"ℹ️ Futures auto-trade skip [{symbol}, user {user_id}]: already holding a position on this symbol")
+        return
+
+    client = await get_user_binance_client(user_id)
+    if not client:
+        logger.warning(f"⚠️ Futures auto-trade skip [{symbol}, user {user_id}]: no connected Binance client")
+        return
+
+    leverage = session["leverage"]
+    try:
+        await client.futures_change_margin_type(symbol=symbol, marginType='ISOLATED')
+    except Exception:
+        pass  # already isolated — Binance errors if you set it to what it already is, harmless
+    try:
+        await client.futures_change_leverage(symbol=symbol, leverage=leverage)
+    except Exception as e:
+        logger.warning(f"⚠️ Futures auto-trade skip [{symbol}, user {user_id}]: couldn't set leverage: {e}")
+        return
+
+    try:
+        account = await client.futures_account()
+        ticker = await binance_client.futures_symbol_ticker(symbol=symbol)
+        price = float(ticker['price'])
+    except Exception as e:
+        logger.warning(f"⚠️ Futures auto-trade skip [{symbol}, user {user_id}]: couldn't fetch balance/price: {e}")
+        return
+
+    balance = float(account.get('availableBalance', 0) or 0)
+    if balance <= 0:
+        logger.warning(f"⚠️ Futures auto-trade skip [{symbol}, user {user_id}]: USDT futures balance is 0")
+        return
+
+    starting_balance = session["starting_balance"]
+    loss_limit_amount = starting_balance * (session["loss_limit_pct"] / 100)
+    if session["realized_pnl"] <= -loss_limit_amount:
+        session["enabled"] = False
+        _save_futures_sessions(futures_sessions)
+        try:
+            await bot.send_message(
+                user_id,
+                f"🛑 *Futures Auto-Trading Stopped — Circuit Breaker*\n\n"
+                f"Realized loss (${session['realized_pnl']:,.2f}) hit your {session['loss_limit_pct']}% limit.",
+                parse_mode='markdown'
+            )
+        except Exception:
+            pass
+        return
+
+    margin_amount = balance * (session["amount_pct"] / 100)
+    notional_value = margin_amount * leverage
+    quantity = notional_value / price
+    side = "BUY" if direction == "BUY" else "SELL"
+    stop_loss_price = price * (1 - session["stop_loss_pct"] / 100) if side == "BUY" else price * (1 + session["stop_loss_pct"] / 100)
+
+    try:
+        order = await client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=round(quantity, 3))
+    except Exception as e:
+        logger.error(f"❌ Futures auto-trade execution error [{symbol}, user {user_id}]: {e}")
+        return
+
+    fill_price = price
+    try:
+        position_info = await client.futures_position_information(symbol=symbol)
+        liquidation_price = float(position_info[0]['liquidationPrice']) if position_info else None
+        entry_from_exchange = float(position_info[0]['entryPrice']) if position_info else None
+        if entry_from_exchange:
+            fill_price = entry_from_exchange
+    except Exception as e:
+        logger.warning(f"⚠️ Couldn't fetch liquidation price for {symbol}: {e}")
+        liquidation_price = None
+
+    add_futures_position(user_id, symbol, side, quantity, fill_price, order.get('orderId'), stop_loss_price, liquidation_price, leverage)
+    session["trades_done"] += 1
+    _save_futures_sessions(futures_sessions)
+
+    direction_label = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+    liq_note = f"\n• Liquidation price: ${liquidation_price:,.4f} ⚠️" if liquidation_price else ""
+    try:
+        await bot.send_message(
+            user_id,
+            f"🤖 *Futures Auto-Trade Executed* ({session['trades_done']}/{session['max_trades']})\n\n"
+            f"• {symbol} {direction_label} — {leverage}x isolated\n"
+            f"• Entry: ${fill_price:,.4f}\n"
+            f"• Stop-loss: ${stop_loss_price:,.4f}"
+            f"{liq_note}\n"
+            f"• Margin used: ${margin_amount:,.2f} ({session['amount_pct']}% of balance)",
+            parse_mode='markdown'
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Could not notify user {user_id} of futures auto-trade: {e}")
+
+async def close_futures_position(bot, user_id, position, reason):
+    client = await get_user_binance_client(user_id)
+    if not client:
+        return
+    close_side = "SELL" if position["side"] == "BUY" else "BUY"
+    try:
+        order = await client.futures_create_order(
+            symbol=position["symbol"], side=close_side, type="MARKET",
+            quantity=round(position["quantity"], 3), reduceOnly=True
+        )
+    except Exception as e:
+        logger.error(f"❌ Futures close error [{position['symbol']}, user {user_id}]: {e}")
+        return
+
+    try:
+        ticker = await binance_client.futures_symbol_ticker(symbol=position["symbol"])
+        exit_price = float(ticker['price'])
+    except Exception:
+        exit_price = position["entry_price"]
+
+    if position["side"] == "BUY":
+        pnl = (exit_price - position["entry_price"]) * position["quantity"]
+    else:
+        pnl = (position["entry_price"] - exit_price) * position["quantity"]
+
+    remove_futures_position(user_id, position["id"])
+    session = get_futures_session(user_id)
+    if session:
+        session["realized_pnl"] = session.get("realized_pnl", 0.0) + pnl
+        _save_futures_sessions(futures_sessions)
+
+    result_label = "Win ✅️🤑" if pnl > 0 else "Lost ❎️🥱"
+    try:
+        await bot.send_message(
+            user_id,
+            f"🤖 *Futures Position Closed* — {reason}\n\n"
+            f"• {position['symbol']} ({position['side']}, {position['leverage']}x)\n"
+            f"• Entry: ${position['entry_price']:,.4f} → Exit: ${exit_price:,.4f}\n"
+            f"• Result: *{result_label}* (${pnl:,.2f})",
+            parse_mode='markdown'
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Could not notify user {user_id} of futures close: {e}")
+
+async def monitor_futures_positions(bot):
+    """Fast-cadence watcher — checks every open futures position against
+    BOTH its own % stop-loss AND Binance's real liquidation price. The
+    liquidation check is a second, independent safety net: if price is
+    getting dangerously close to actual liquidation (not just our stop-loss
+    level), it closes early rather than risk the exchange force-closing it."""
+    while True:
+        await asyncio.sleep(STOP_LOSS_CHECK_SECONDS)
+        if not binance_client:
+            continue
+        for user_id_str, positions in list(futures_positions.items()):
+            user_id = int(user_id_str)
+            for p in list(positions):
+                try:
+                    ticker = await binance_client.futures_symbol_ticker(symbol=p["symbol"])
+                    current_price = float(ticker['price'])
+                except Exception as e:
+                    logger.warning(f"⚠️ Futures price check failed for {p['symbol']}: {e}")
+                    continue
+
+                stop_hit = (
+                    (p["side"] == "BUY" and current_price <= p["stop_loss_price"]) or
+                    (p["side"] == "SELL" and current_price >= p["stop_loss_price"])
+                )
+                liq_price = p.get("liquidation_price")
+                near_liquidation = False
+                if liq_price:
+                    distance = abs(p["entry_price"] - liq_price)
+                    safety_buffer = liq_price + (distance * 0.2 if p["side"] == "BUY" else -distance * 0.2)
+                    near_liquidation = (
+                        (p["side"] == "BUY" and current_price <= safety_buffer) or
+                        (p["side"] == "SELL" and current_price >= safety_buffer)
+                    )
+
+                if stop_hit:
+                    await close_futures_position(bot, user_id, p, "🛑 Stop-loss triggered")
+                elif near_liquidation:
+                    await close_futures_position(bot, user_id, p, "⚠️ Closed early — approaching liquidation price")
+
+def futures_leverage_buttons():
+    rows = [[Button.inline(f"{lv}x", f"futures:leverage:{lv}".encode()) for lv in [2, 3, 5]]]
+    rows.append([Button.inline("✏️ Type a custom leverage", b"futures:leverage:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def futures_amount_pct_buttons():
+    rows = [[Button.inline(f"{p}%", f"futures:amountpct:{p}".encode()) for p in [2, 5, 10]]]
+    rows.append([Button.inline("✏️ Type a custom %", b"futures:amountpct:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def futures_stoploss_pct_buttons():
+    rows = [[Button.inline(f"{p}%", f"futures:stoplosspct:{p}".encode()) for p in [1, 2, 3]]]
+    rows.append([Button.inline("✏️ Type a custom %", b"futures:stoplosspct:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+def futures_losslimit_pct_buttons():
+    rows = [[Button.inline(f"{p}%", f"futures:losslimitpct:{p}".encode()) for p in [5, 10, 15]]]
+    rows.append([Button.inline("✏️ Type a custom %", b"futures:losslimitpct:custom")])
+    rows.append([Button.inline("🏠 Main Menu", b"menu:main")])
+    return rows
+
+async def send_futures_status(bot, chat, user_id):
+    session = get_futures_session(user_id)
+    if not session or not session.get("enabled"):
+        await bot.send_message(
+            chat,
+            "⚡ *Futures Trading* — currently OFF\n\n"
+            "Same strategy and scanner as spot, but leveraged — and both "
+            "BUY (long) and SELL (short) signals are actionable here.\n\n"
+            "⚠️ Futures uses leverage — a losing move is amplified. Every "
+            "position still gets a % stop-loss AND is watched against "
+            "Binance's real liquidation price as a second safety net. "
+            "Margin type is always ISOLATED (never cross), so risk stays "
+            "capped to each position's own margin.\n\n"
+            "Requires Binance Futures-enabled keys (Futures Testnet keys "
+            "are separate from Spot Testnet keys — see testnet.binancefuture.com).",
+            buttons=[[Button.inline("🚀 Set Up Futures Trading", b"futures:setup_start")],
+                     [Button.inline("🏠 Main Menu", b"menu:main")]],
+            parse_mode='markdown'
+        )
+        return
+    await bot.send_message(
+        chat,
+        f"⚡ *Futures Trading* — currently ON ✅\n\n"
+        f"• Trades so far: {session['trades_done']}/{session['max_trades']}\n"
+        f"• Leverage: {session['leverage']}x (isolated)\n"
+        f"• Margin per trade: {session['amount_pct']}% of balance\n"
+        f"• Stop-loss per trade: {session['stop_loss_pct']}%\n"
+        f"• Loss limit (circuit breaker): {session['loss_limit_pct']}%\n"
+        f"• Realized P&L this session: ${session.get('realized_pnl', 0):,.2f}\n"
+        f"• Symbols: {', '.join(session['symbols'])}",
+        buttons=[[Button.inline("🛑 Stop Futures Trading", b"futures:stop")],
+                 [Button.inline("🏠 Main Menu", b"menu:main")]],
+        parse_mode='markdown'
+    )
+
+async def confirm_futures_setup(event, bot, state):
+    client = await get_user_binance_client(event.sender_id)
+    if not client:
+        await event.respond("You haven't connected a Binance account yet. Use /connectbinance to set it up. 🔐")
+        return
+    try:
+        account = await client.futures_account()
+    except Exception as e:
+        await event.respond(
+            f"⚠️ Couldn't fetch your futures balance: {e}\n\n"
+            f"If you're on testnet, remember Futures Testnet needs its own keys "
+            f"from testnet.binancefuture.com — Spot Testnet keys won't work here."
+        )
+        return
+
+    starting_balance = float(account.get('availableBalance', 0) or 0)
+    mode_label = "🧪 TESTNET (fake money)" if BINANCE_TESTNET else "⚠️ LIVE (real money)"
+    session_preview = {
+        "enabled": False, "leverage": state["leverage"], "amount_pct": state["amount_pct"],
+        "stop_loss_pct": state["stop_loss_pct"], "loss_limit_pct": state["loss_limit_pct"],
+        "max_trades": state["max_trades"], "trades_done": 0, "starting_balance": starting_balance,
+        "realized_pnl": 0.0, "symbols": list(SCAN_SYMBOLS)
+    }
+    futures_setup_state[event.sender_id] = {"pending_session": session_preview}
+    await event.respond(
+        f"⚡ *Confirm Futures Trading Setup* — {mode_label}\n\n"
+        f"• Leverage: *{state['leverage']}x* (isolated margin)\n"
+        f"• Margin per trade: *{state['amount_pct']}%* of balance\n"
+        f"• Stop-loss per trade: *{state['stop_loss_pct']}%*\n"
+        f"• Loss limit (circuit breaker): *{state['loss_limit_pct']}%* "
+        f"(≈ ${starting_balance * state['loss_limit_pct'] / 100:,.2f})\n"
+        f"• Max trades this session: *{state['max_trades']}*\n"
+        f"• Watching: {', '.join(SCAN_SYMBOLS)} (both long AND short)\n"
+        f"• Starting futures balance: *${starting_balance:,.2f} USDT*\n\n"
+        f"⚠️ Leverage amplifies both gains and losses. Trades fire automatically.",
+        buttons=[[Button.inline("🚀 Start Futures Trading", b"futures:start")],
+                 [Button.inline("❌ Cancel", b"menu:main")]],
+        parse_mode='markdown'
+    )
+
+async def handle_futures_setup_text(event, bot):
+    state = futures_setup_state.get(event.sender_id)
+    if not state:
+        return False
+    text = event.raw_text.strip()
+
+    if state["step"] == "awaiting_leverage_text":
+        try:
+            lv = int(text)
+            if lv <= 0 or lv > LEVERAGE_MAX_ALLOWED:
+                raise ValueError
+        except ValueError:
+            await event.respond(f"⚠️ Type a whole number between 1 and {LEVERAGE_MAX_ALLOWED}, e.g. `3`")
+            return True
+        state["leverage"] = lv
+        state["step"] = "awaiting_amount_pct"
+        await event.respond("📊 What % of your futures balance as margin per trade?", buttons=futures_amount_pct_buttons(), parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_amount_pct_text":
+        try:
+            pct = float(text)
+            if pct <= 0 or pct > 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a valid percentage, e.g. `5`")
+            return True
+        state["amount_pct"] = pct
+        state["step"] = "awaiting_stoploss_pct"
+        await event.respond("📊 Stop-loss % per trade:", buttons=futures_stoploss_pct_buttons(), parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_stoploss_pct_text":
+        try:
+            pct = float(text)
+            if pct <= 0 or pct > 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a valid percentage, e.g. `2`")
+            return True
+        state["stop_loss_pct"] = pct
+        state["step"] = "awaiting_losslimit_pct"
+        await event.respond("📊 Loss limit % — stops ALL futures trading if hit:", buttons=futures_losslimit_pct_buttons(), parse_mode='markdown')
+        return True
+
+    if state["step"] == "awaiting_losslimit_pct_text":
+        try:
+            pct = float(text)
+            if pct <= 0 or pct > 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a valid percentage, e.g. `10`")
+            return True
+        state["loss_limit_pct"] = pct
+        state["step"] = "awaiting_max_trades"
+        await event.respond("📊 How many trades total should this session run?")
+        return True
+
+    if state["step"] == "awaiting_max_trades":
+        try:
+            count = int(text)
+            if count <= 0:
+                raise ValueError
+        except ValueError:
+            await event.respond("⚠️ Type a whole number, e.g. `20`")
+            return True
+        state["max_trades"] = count
+        futures_setup_state.pop(event.sender_id, None)
+        await confirm_futures_setup(event, bot, state)
+        return True
+
+    return False
+
+def setup_futures_handlers(bot):
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/futures$'))
+    async def futures_command(event):
+        await send_futures_status(bot, await event.get_chat(), event.sender_id)
+
+    @bot.on(events.NewMessage(incoming=True, pattern=r'^/stopfutures$'))
+    async def stopfutures_command(event):
+        stop_futures_session(event.sender_id)
+        await event.respond("🛑 Futures trading stopped. Existing positions are still protected by their stop-losses and liquidation watcher.")
+
+    @bot.on(events.CallbackQuery(data=b"menu:futures"))
+    async def futures_menu_callback(event):
+        await event.answer()
+        await send_futures_status(bot, await event.get_chat(), event.sender_id)
+
+    @bot.on(events.CallbackQuery(data=b"futures:setup_start"))
+    async def futures_setup_start_callback(event):
+        if not await get_user_binance_client(event.sender_id):
+            await event.edit(
+                "You haven't connected a Binance account yet.\n\nUse /connectbinance first. 🔐",
+                buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]]
+            )
+            return
+        futures_setup_state[event.sender_id] = {"step": "awaiting_leverage"}
+        await event.edit(
+            f"⚡ Choose your leverage (max {LEVERAGE_MAX_ALLOWED}x — low leverage strongly recommended):",
+            buttons=futures_leverage_buttons(), parse_mode='markdown'
+        )
+
+    @bot.on(events.CallbackQuery(pattern=rb"^futures:leverage:(custom|\d+)$"))
+    async def futures_leverage_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        if choice == "custom":
+            futures_setup_state[event.sender_id] = {"step": "awaiting_leverage_text"}
+            await event.edit(f"✏️ Type your leverage (1-{LEVERAGE_MAX_ALLOWED}), e.g. `3`:", buttons=None, parse_mode='markdown')
+            return
+        futures_setup_state[event.sender_id] = {"step": "awaiting_amount_pct", "leverage": int(choice)}
+        await event.edit("📊 What % of your futures balance as margin per trade?", buttons=futures_amount_pct_buttons(), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^futures:amountpct:(custom|\d+)$"))
+    async def futures_amountpct_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        state = futures_setup_state.get(event.sender_id, {})
+        if choice == "custom":
+            state["step"] = "awaiting_amount_pct_text"
+            futures_setup_state[event.sender_id] = state
+            await event.edit("✏️ Type the % of balance as margin per trade, e.g. `5`:", buttons=None, parse_mode='markdown')
+            return
+        state["amount_pct"] = float(choice)
+        state["step"] = "awaiting_stoploss_pct"
+        futures_setup_state[event.sender_id] = state
+        await event.edit("📊 Stop-loss % per trade:", buttons=futures_stoploss_pct_buttons(), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^futures:stoplosspct:(custom|\d+)$"))
+    async def futures_stoplosspct_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        state = futures_setup_state.get(event.sender_id, {})
+        if choice == "custom":
+            state["step"] = "awaiting_stoploss_pct_text"
+            futures_setup_state[event.sender_id] = state
+            await event.edit("✏️ Type the stop-loss % per trade, e.g. `2`:", buttons=None, parse_mode='markdown')
+            return
+        state["stop_loss_pct"] = float(choice)
+        state["step"] = "awaiting_losslimit_pct"
+        futures_setup_state[event.sender_id] = state
+        await event.edit("📊 Loss limit % — stops ALL futures trading if hit:", buttons=futures_losslimit_pct_buttons(), parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(pattern=rb"^futures:losslimitpct:(custom|\d+)$"))
+    async def futures_losslimitpct_callback(event):
+        choice = event.pattern_match.group(1).decode()
+        state = futures_setup_state.get(event.sender_id, {})
+        if choice == "custom":
+            state["step"] = "awaiting_losslimit_pct_text"
+            futures_setup_state[event.sender_id] = state
+            await event.edit("✏️ Type the loss-limit %, e.g. `10`:", buttons=None, parse_mode='markdown')
+            return
+        state["loss_limit_pct"] = float(choice)
+        state["step"] = "awaiting_max_trades"
+        futures_setup_state[event.sender_id] = state
+        await event.edit("📊 How many trades total should this session run? Type a number:", buttons=None)
+
+    @bot.on(events.CallbackQuery(data=b"futures:start"))
+    async def futures_start_callback(event):
+        state = futures_setup_state.pop(event.sender_id, None)
+        if not state or "pending_session" not in state:
+            await event.answer("Setup expired — please start again with /futures.", alert=True)
+            return
+        session = state["pending_session"]
+        session["enabled"] = True
+        save_futures_session(event.sender_id, session)
+        mode_label = "🧪 TESTNET" if BINANCE_TESTNET else "⚠️ LIVE"
+        await event.edit(f"✅ *Futures Trading started!* ({mode_label})\n\nWatching {', '.join(session['symbols'])} for both longs and shorts.", buttons=None, parse_mode='markdown')
+
+    @bot.on(events.CallbackQuery(data=b"futures:stop"))
+    async def futures_stop_callback(event):
+        stop_futures_session(event.sender_id)
+        await event.edit("🛑 Futures trading stopped. Existing positions remain protected.", buttons=[[Button.inline("🏠 Main Menu", b"menu:main")]])
+
+    logger.info("✅ Futures trading handlers registered (/futures, /stopfutures)")
 
 # ══════════════════════════════════════════════════════════════
 # END NEW menu code
@@ -3058,6 +3760,7 @@ async def run_bot():
     setup_binance_trading_handler(bot)
     setup_opportunity_alerts_handlers(bot)
     setup_autotrade_handlers(bot)
+    setup_futures_handlers(bot)
     await resolve_signal_groups(bot)
 
     logger.info("📥 Finding source group...")
@@ -3211,6 +3914,7 @@ async def run_bot():
     asyncio.create_task(keepalive(userbot))
     asyncio.create_task(scan_for_opportunities(bot))
     asyncio.create_task(monitor_stop_losses(bot))
+    asyncio.create_task(monitor_futures_positions(bot))
     await userbot.run_until_disconnected()
     return True
 
