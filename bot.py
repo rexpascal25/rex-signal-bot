@@ -798,6 +798,23 @@ and probabilities, not certainties.
 - Don't hand someone a specific "buy/sell right now, this amount" call as if it \
 were financial advice to act on with real money. Instead help them learn to \
 read the chart and decide for themselves.
+
+CHART SCREENSHOT ANALYSIS
+- When someone sends a chart screenshot (e.g. from Pocket Option, IQ Option, \
+or anywhere else), you CAN and SHOULD give a clear directional read — BUY or \
+SELL — the same way the bot's own scanner gives verdicts elsewhere. Don't be \
+vague or refuse to commit to a direction.
+- Read what's actually visible: candle colors and pattern (trending vs mixed/ \
+ranging), any visible moving averages (price above/below them), any visible \
+oscillator or MACD-style indicator, obvious support/resistance levels.
+- Apply the same trend-vs-range discipline as the Trending Strategy: only \
+give a confident BUY/SELL read if the visible candles show a real trend \
+(not a mixed/choppy sequence) with indicators agreeing on direction. If the \
+image looks genuinely ranging or the indicators conflict, say so plainly \
+instead of forcing a call.
+- Always give your reasoning alongside the call (which candles, which \
+indicator readings led you there), and always frame it as your read of what's \
+visible — not a guarantee of the outcome, same as everywhere else in this bot.
 - Be honest about risk when it's relevant: binary options and OTC synthetic \
 markets are high-risk, and martingale can wipe out an account fast across a \
 losing streak. Mention this naturally when it fits, without being preachy \
@@ -3044,16 +3061,21 @@ def setup_binance_trading_handler(bot):
 
     logger.info("✅ Binance trading handler registered (/trade command + guided button flow)")
 
-async def get_agent_reply(user_id, user_text):
+async def get_agent_reply(user_id, user_text, image_bytes=None):
     """Calls Gemini with this user's running conversation history and
     returns Rex's reply text. Raises AgentLimitReached if the free daily
-    quota has been used up."""
+    quota has been used up. Pass image_bytes (raw JPEG/PNG bytes) to have
+    Rex analyze a chart screenshot alongside the text."""
     history = agent_conversations.setdefault(user_id, [])
 
     live_context = await build_live_data_context(user_text)
     augmented_text = user_text + ("\n" + live_context if live_context else "")
 
-    history.append({"role": "user", "parts": [augmented_text]})
+    if image_bytes is not None:
+        image_part = {"mime_type": "image/jpeg", "data": image_bytes}
+        history.append({"role": "user", "parts": [image_part, augmented_text]})
+    else:
+        history.append({"role": "user", "parts": [augmented_text]})
     del history[:-MAX_HISTORY_MESSAGES]  # keep only the most recent messages
 
     try:
@@ -3115,6 +3137,55 @@ def setup_agent_handler(bot):
             return
 
         # Telegram message length safety (4096 char limit)
+        for i in range(0, len(reply_text), 3900):
+            await event.respond(reply_text[i:i + 3900])
+
+    @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and bool(e.photo)))
+    async def agent_photo_handler(event):
+        """Lets users send a chart screenshot (e.g. Pocket Option OTC) for
+        Rex to read and give a directional call on — since there's no way
+        to pull OTC data automatically, this is the legitimate path: the
+        user's own screenshot of their own account, analyzed like any
+        other image."""
+        if not gemini_model:
+            await event.respond(
+                "🤖 The Market Analyst isn't set up yet — the bot owner needs to "
+                "add a GEMINI_API_KEY. 🔧"
+            )
+            return
+
+        try:
+            image_bytes = await bot.download_media(event.message, file=bytes)
+        except Exception as e:
+            await event.respond(f"⚠️ Couldn't read that image: {e}")
+            return
+
+        caption = event.message.text or (
+            "Analyze this chart screenshot — read the candle colors/pattern, "
+            "the trend, and any visible indicators (moving averages, MACD, "
+            "oscillators). Give me your read: does this look like a BUY or "
+            "SELL setup right now, and why?"
+        )
+
+        try:
+            async with bot.action(event.chat_id, 'typing'):
+                reply_text = await get_agent_reply(event.sender_id, caption, image_bytes=image_bytes)
+        except AgentLimitReached:
+            wait_str = time_until_gemini_reset()
+            await event.respond(
+                "🤖 I've hit my free daily question limit for today! 😅\n\n"
+                f"It resets at midnight Pacific Time — that's *{wait_str}* from "
+                "now. Come back after that and I'll be ready to chat again! 🔄📊",
+                parse_mode='markdown'
+            )
+            return
+        except Exception as e:
+            logger.error(f"❌ Analyst agent image error: {e}")
+            await event.respond(
+                "⚠️ Sorry, I couldn't read that chart right now — try again in a moment. 🔄"
+            )
+            return
+
         for i in range(0, len(reply_text), 3900):
             await event.respond(reply_text[i:i + 3900])
 
