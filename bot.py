@@ -10,6 +10,7 @@ import os
 import json
 import math
 import logging
+import store
 
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
@@ -3969,6 +3970,10 @@ async def run_bot():
 
             message_map[message.id] = sent.id
             logger.info(f"✅ Forwarded: {message.id} → {sent.id}")
+            try:
+                store.save_signal(message.id, processed_text)  # also saved for the signal store
+            except Exception as e:
+                logger.error(f"❌ Store save error: {e}")  # the group post already went out
 
         except Exception as e:
             logger.error(f"❌ Forward error: {e}")
